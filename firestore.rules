@@ -1,0 +1,116 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Global helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // Helper to extract resource data
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Entity validations
+    function isValidUser(data) {
+      return data.keys().hasAll(['id', 'username', 'email', 'streak', 'lastActiveDate', 'xp', 'rank', 'level', 'completion', 'verifiedTopics', 'following'])
+        && data.keys().size() == 11
+        && data.id is string
+        && data.username is string && data.username.size() <= 50
+        && data.email is string && data.email.size() <= 150
+        && data.streak is int && data.streak >= 0
+        && (data.lastActiveDate == null || data.lastActiveDate is string)
+        && data.xp is int && data.xp >= 0
+        && data.rank is string && data.rank.size() <= 100
+        && data.level is int && data.level >= 0
+        && data.completion is int && data.completion >= 0 && data.completion <= 100
+        && data.verifiedTopics is list
+        && data.following is list;
+    }
+
+    function isValidPost(data) {
+      return data.keys().hasAll(['id', 'title', 'author', 'authorRole', 'content', 'category', 'upvotes', 'createdAt', 'commentsCount'])
+        && data.keys().size() == 9
+        && data.id is string
+        && data.title is string && data.title.size() <= 150
+        && data.author is string && data.author.size() <= 50
+        && data.authorRole is string
+        && data.content is string && data.content.size() <= 5000
+        && data.category is string
+        && data.upvotes is int
+        && data.createdAt is string
+        && data.commentsCount is int;
+    }
+
+    function isValidLabNote(data) {
+      return data.keys().hasAll(['id', 'userId', 'title', 'content', 'lastUpdated'])
+        && data.keys().size() == 5
+        && data.id is string
+        && data.userId is string
+        && data.title is string && data.title.size() <= 100
+        && data.content is string && data.content.size() <= 10000
+        && data.lastUpdated is string;
+    }
+
+    function isValidTimelineEvent(data) {
+      return data.keys().hasAll(['id', 'username', 'action', 'xpReward', 'timestamp'])
+        && data.keys().size() == 5
+        && data.id is string
+        && data.username is string
+        && data.action is string && data.action.size() <= 200
+        && data.xpReward is int && data.xpReward >= 0
+        && data.timestamp is string;
+    }
+
+    // Rules matching
+    match /users/{userId} {
+      allow get: if isSignedIn();
+      allow list: if isSignedIn();
+      allow create: if isOwner(userId) && isValidUser(incoming());
+      allow update: if isOwner(userId) && isValidUser(incoming());
+      allow delete: if false;
+
+      match /labNotes/{noteId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidLabNote(incoming()) && incoming().userId == userId;
+        allow update: if isOwner(userId) && isValidLabNote(incoming()) && incoming().userId == userId;
+        allow delete: if isOwner(userId);
+      }
+    }
+
+    match /posts/{postId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && isValidPost(incoming());
+      allow update: if isSignedIn() && isValidPost(incoming()) && (
+        // Allow author to update content or title
+        incoming().author == existing().author && incoming().id == existing().id
+        // Allow anyone signed in to upvote (update only upvotes and commentsCount)
+        || incoming().diff(existing()).affectedKeys().hasAny(['upvotes', 'commentsCount'])
+      );
+      allow delete: if false; // Deletion is disabled for logs integrity
+    }
+
+    match /timelineEvents/{eventId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && isValidTimelineEvent(incoming());
+      allow update, delete: if false;
+    }
+  }
+}

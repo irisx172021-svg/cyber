@@ -1,0 +1,179 @@
+{
+  "entities": {
+    "user": {
+      "title": "User",
+      "description": "User profile containing academic progress and stats.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "The user's unique ID."
+        },
+        "username": {
+          "type": "string",
+          "maxLength": 50,
+          "description": "The custom username handle."
+        },
+        "email": {
+          "type": "string",
+          "description": "The user's operational email address."
+        },
+        "streak": {
+          "type": "integer",
+          "description": "Daily sign-in streak."
+        },
+        "lastActiveDate": {
+          "type": "string",
+          "description": "Date of last activity (YYYY-MM-DD)."
+        },
+        "xp": {
+          "type": "integer",
+          "description": "Experience points accumulated."
+        },
+        "rank": {
+          "type": "string",
+          "description": "Title achieved in the academy."
+        },
+        "level": {
+          "type": "integer",
+          "description": "Numeric level of the user."
+        },
+        "completion": {
+          "type": "integer",
+          "description": "Progress completion percentage."
+        },
+        "verifiedTopics": {
+          "type": "array",
+          "description": "List of completed lesson IDs."
+        },
+        "following": {
+          "type": "array",
+          "description": "List of usernames the user is following."
+        }
+      },
+      "required": ["id", "username", "email", "streak", "xp", "rank", "level", "completion"]
+    },
+    "post": {
+      "title": "Post",
+      "description": "A community forum post.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique identifier of the post."
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 150,
+          "description": "The post's title."
+        },
+        "author": {
+          "type": "string",
+          "description": "Username handle of the author."
+        },
+        "authorRole": {
+          "type": "string",
+          "description": "Role profile of the author."
+        },
+        "content": {
+          "type": "string",
+          "maxLength": 5000,
+          "description": "The body text of the post."
+        },
+        "category": {
+          "type": "string",
+          "description": "Category folder of the discussion."
+        },
+        "upvotes": {
+          "type": "integer",
+          "description": "Current vote weight."
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Timestamp when the post was created."
+        },
+        "commentsCount": {
+          "type": "integer",
+          "description": "Total feedback comments."
+        }
+      },
+      "required": ["id", "title", "author", "content", "category", "upvotes", "createdAt"]
+    },
+    "labNote": {
+      "title": "LabNote",
+      "description": "Interactive notebook laboratory notes.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique note ID."
+        },
+        "userId": {
+          "type": "string",
+          "description": "Owner identifier."
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 100,
+          "description": "Subject of the notes."
+        },
+        "content": {
+          "type": "string",
+          "maxLength": 10000,
+          "description": "Technical notes body."
+        },
+        "lastUpdated": {
+          "type": "string",
+          "description": "Timestamp of last save."
+        }
+      },
+      "required": ["id", "userId", "title", "content", "lastUpdated"]
+    },
+    "timelineEvent": {
+      "title": "TimelineEvent",
+      "description": "Academy-wide system event or student milestone.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique event ID."
+        },
+        "username": {
+          "type": "string",
+          "description": "Subject of the event."
+        },
+        "action": {
+          "type": "string",
+          "description": "The activity description."
+        },
+        "xpReward": {
+          "type": "integer",
+          "description": "XP received for this activity."
+        },
+        "timestamp": {
+          "type": "string",
+          "description": "Event timestamp."
+        }
+      },
+      "required": ["id", "username", "action", "xpReward", "timestamp"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "user",
+      "description": "User profiles and credentials storage."
+    },
+    "/posts/{postId}": {
+      "schema": "post",
+      "description": "Community discussions."
+    },
+    "/users/{userId}/labNotes/{noteId}": {
+      "schema": "labNote",
+      "description": "Academic laboratory notes."
+    },
+    "/timelineEvents/{eventId}": {
+      "schema": "timelineEvent",
+      "description": "Platform-wide milestone events feed."
+    }
+  }
+}

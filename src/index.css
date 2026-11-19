@@ -1,0 +1,45 @@
+@import "tailwindcss";
+@import "highlight.js/styles/github-dark.css";
+
+@theme {
+  --font-sans: 'Plus Jakarta Sans', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+@layer base {
+  html,
+  body {
+    font-family: var(--font-sans);
+    background-color: #020617;
+    color: #f1f5f9;
+  }
+
+  code,
+  pre,
+  kbd,
+  samp {
+    font-family: var(--font-mono);
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Ensure highlight.js background integrates cleanly with dark code containers */
+.hljs {
+  background: transparent !important;
+  padding: 0 !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
