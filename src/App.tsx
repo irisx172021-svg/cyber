@@ -14,10 +14,12 @@ import AuthModal from './components/AuthModal';
 import LandingPage from './components/LandingPage';
 import AiTutorPanel from './components/AiTutorPanel';
 import Capstones from './components/Capstones';
+import LearningPreferencesModal from './components/journey/LearningPreferencesModal';
 import { MessageSquare } from 'lucide-react';
 
 import { LEGACY_LESSON_ID_MAP, resolveCanonicalLessonId } from './data/curriculumMetadata';
 import { computeCurriculumStats } from './lib/curriculumProgress';
+import { createDefaultLearningProfile, normalizeLearningProfile } from './lib/learningProfile';
 import {
   DEFAULT_PROGRESS,
   DEFAULT_LAB_NOTES,
@@ -38,6 +40,8 @@ import {
   Tier,
   PracticalLab,
   EngageApiResponse,
+  LearningExperienceLevel,
+  LearningProfile,
 } from './types';
 import {
   apiGetCurriculum,
@@ -55,6 +59,7 @@ import {
   apiLogout,
   apiGetMe,
   apiInitCsrf,
+  apiUpdateLearningProfile,
   setUnauthorizedHandler,
   clearClientAuthMemory,
 } from './lib/api';
@@ -66,6 +71,8 @@ export default function App() {
 
   const [selectedLessonId, setSelectedLessonIdState] = useState<string>('comp-hardware');
   const [selectedTierId, setSelectedTierId] = useState<string>('tier-1');
+  const [tracksViewMode, setTracksViewMode] = useState<'journey' | 'tiers'>('journey');
+  const [selectedStageId, setSelectedStageId] = useState<string>('stage-1');
 
   const setSelectedLessonId = (lessonId: string) => {
     setSelectedLessonIdState(resolveCanonicalLessonId(lessonId));
@@ -88,7 +95,17 @@ export default function App() {
   const [labExploration, setLabExploration] = useState<LabExplorationMap>({});
   const [capstoneProgress, setCapstoneProgress] = useState<CapstoneProgressMap>({});
   const [progress, setProgress] = useState<UserProgress>(DEFAULT_PROGRESS);
+  const [guestLearningProfile, setGuestLearningProfile] = useState<LearningProfile>(() =>
+    createDefaultLearningProfile()
+  );
+  const [preferencesModalOpen, setPreferencesModalOpen] = useState<boolean>(false);
+  const [preferencesSaving, setPreferencesSaving] = useState<boolean>(false);
+  const [preferencesError, setPreferencesError] = useState<string | null>(null);
   const [authModalOpen, setAuthModalOpen] = useState<boolean>(false);
+
+  const activeLearningProfile: LearningProfile = user
+    ? normalizeLearningProfile(user.learningProfile)
+    : guestLearningProfile;
 
   const [terminalConfigs, setTerminalConfigs] = useState<Record<string, string>>(() => {
     const cached = localStorage.getItem('cfa_terminal_configs');
@@ -121,6 +138,8 @@ export default function App() {
     setLabNotes(DEFAULT_LAB_NOTES);
     setLabExploration({});
     setCapstoneProgress({});
+    setGuestLearningProfile(createDefaultLearningProfile());
+    setPreferencesModalOpen(false);
     setGlobalAiTutorOpen(false);
     setActiveTab((prev) => (prev === 'tracks' ? 'tracks' : 'landing'));
     if (openLoginPrompt) {
@@ -436,6 +455,97 @@ export default function App() {
     []
   );
 
+  const handleSaveLearningPreferences = React.useCallback(
+    async (input: {
+      interests: string[];
+      experienceLevel: LearningExperienceLevel;
+      goals: string;
+    }) => {
+      setPreferencesError(null);
+      if (!user) {
+        setGuestLearningProfile({
+          interests: input.interests,
+          experienceLevel: input.experienceLevel,
+          goals: input.goals,
+          onboardingCompleted: true,
+          updatedAt: new Date().toISOString(),
+        });
+        setPreferencesModalOpen(false);
+        return;
+      }
+
+      setPreferencesSaving(true);
+      try {
+        const res = await apiUpdateLearningProfile({
+          action: 'save',
+          interests: input.interests,
+          experienceLevel: input.experienceLevel,
+          goals: input.goals,
+          onboardingCompleted: true,
+        });
+        setUser(res.user);
+        setPreferencesModalOpen(false);
+      } catch (err: any) {
+        setPreferencesError(err?.message || 'Unable to save learning preferences.');
+      } finally {
+        setPreferencesSaving(false);
+      }
+    },
+    [user]
+  );
+
+  const handleSkipOnboarding = React.useCallback(async () => {
+    setPreferencesError(null);
+    if (!user) {
+      setGuestLearningProfile((prev) => ({
+        ...prev,
+        interests: [],
+        goals: '',
+        onboardingCompleted: true,
+        updatedAt: new Date().toISOString(),
+      }));
+      setPreferencesModalOpen(false);
+      return;
+    }
+
+    setPreferencesSaving(true);
+    try {
+      const res = await apiUpdateLearningProfile({ action: 'skip' });
+      setUser(res.user);
+      setPreferencesModalOpen(false);
+    } catch (err: any) {
+      setPreferencesError(err?.message || 'Unable to skip onboarding right now.');
+    } finally {
+      setPreferencesSaving(false);
+    }
+  }, [user]);
+
+  const handleClearInterests = React.useCallback(async () => {
+    setPreferencesError(null);
+    if (!user) {
+      setGuestLearningProfile((prev) => ({
+        ...prev,
+        interests: [],
+        goals: '',
+        onboardingCompleted: true,
+        updatedAt: new Date().toISOString(),
+      }));
+      setPreferencesModalOpen(false);
+      return;
+    }
+
+    setPreferencesSaving(true);
+    try {
+      const res = await apiUpdateLearningProfile({ action: 'clear' });
+      setUser(res.user);
+      setPreferencesModalOpen(false);
+    } catch (err: any) {
+      setPreferencesError(err?.message || 'Unable to clear selections right now.');
+    } finally {
+      setPreferencesSaving(false);
+    }
+  }, [user]);
+
   const handleAuthSuccess = (
     authenticatedUser: User,
     initialProgress?: UserProgress,
@@ -545,9 +655,25 @@ export default function App() {
                     capstoneProgress={capstoneProgress}
                     communityPosts={communityPosts}
                     labNotes={labNotes}
+                    learningProfile={activeLearningProfile}
+                    onOpenPreferencesModal={() => {
+                      setPreferencesError(null);
+                      setPreferencesModalOpen(true);
+                    }}
                     setActiveTab={handleTabChange}
                     setSelectedLessonId={setSelectedLessonId}
-                    onSelectTier={(tierId) => setSelectedTierId(tierId)}
+                    onSelectTier={(tierId) => {
+                      setSelectedTierId(tierId);
+                      setTracksViewMode('tiers');
+                    }}
+                    onSelectStage={(stageId) => {
+                      setSelectedStageId(stageId);
+                      setTracksViewMode('journey');
+                    }}
+                    onBrowseClassicTiers={() => {
+                      setTracksViewMode('tiers');
+                      handleTabChange('tracks');
+                    }}
                   />
                 )}
 
@@ -556,12 +682,25 @@ export default function App() {
                     curriculum={curriculum}
                     labsByLesson={labsByLesson}
                     progress={progress}
+                    capstoneProgress={capstoneProgress}
+                    learningProfile={activeLearningProfile}
+                    onOpenPreferencesModal={() => {
+                      setPreferencesError(null);
+                      setPreferencesModalOpen(true);
+                    }}
+                    onSkipOnboarding={handleSkipOnboarding}
+                    onClearInterests={handleClearInterests}
                     setActiveTab={handleTabChange}
                     setSelectedLessonId={setSelectedLessonId}
                     user={user}
                     onLoginRequired={() => setAuthModalOpen(true)}
                     selectedTierId={selectedTierId}
                     onSelectTierId={setSelectedTierId}
+                    viewMode={tracksViewMode}
+                    onChangeViewMode={setTracksViewMode}
+                    selectedStageId={selectedStageId}
+                    onSelectStageId={setSelectedStageId}
+                    onOpenCapstones={() => handleTabChange('capstones')}
                   />
                 )}
 
@@ -678,6 +817,20 @@ export default function App() {
         isOpen={authModalOpen}
         onClose={() => setAuthModalOpen(false)}
         onAuthSuccess={handleAuthSuccess}
+      />
+
+      <LearningPreferencesModal
+        isOpen={preferencesModalOpen}
+        onClose={() => {
+          if (!preferencesSaving) setPreferencesModalOpen(false);
+        }}
+        currentProfile={activeLearningProfile}
+        isAuthenticated={Boolean(user)}
+        saving={preferencesSaving}
+        error={preferencesError}
+        onSave={handleSaveLearningPreferences}
+        onSkip={handleSkipOnboarding}
+        onClear={handleClearInterests}
       />
     </div>
   );

@@ -1,3 +1,13 @@
+export type LearningExperienceLevel = 'beginner' | 'some_experience' | 'experienced';
+
+export interface LearningProfile {
+  interests: string[];
+  experienceLevel: LearningExperienceLevel;
+  goals?: string;
+  onboardingCompleted: boolean;
+  updatedAt: string | null;
+}
+
 export interface User {
   id: string;
   username: string;
@@ -13,6 +23,7 @@ export interface User {
   followers?: string[];
   lastStreakUpdate?: string | null;
   lastActiveTimestamp?: string | null;
+  learningProfile?: LearningProfile;
 }
 
 export interface PublicDirectoryUser {

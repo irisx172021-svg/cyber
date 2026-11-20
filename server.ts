@@ -106,6 +106,11 @@ import {
   resolveTrustProxyConfig,
   sanitizePostForClient,
 } from './src/server/security.ts';
+import {
+  createDefaultLearningProfile,
+  normalizeLearningProfile,
+  validateLearningProfileUpdate,
+} from './src/lib/learningProfile.ts';
 
 const DEFAULT_DB_PATH = path.join(process.cwd(), 'database.json');
 
@@ -225,6 +230,7 @@ export function loadDb(dbPath = DEFAULT_DB_PATH): DbSchema {
         verifiedTopics: completed,
         following: [...(dirUser.following || [])],
         followers: [...(dirUser.followers || [])],
+        learningProfile: createDefaultLearningProfile(),
       },
       progress: {
         schemaVersion: CURRENT_PROGRESS_SCHEMA_VERSION,
@@ -637,6 +643,7 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
           followers: [],
           lastStreakUpdate: null,
           lastActiveTimestamp: null,
+          learningProfile: createDefaultLearningProfile(),
         };
 
         const newProgress: UserProgress = {
@@ -976,6 +983,60 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
       return res.status(result.errorStatus).json({ error: result.error });
     }
     return res.json(result);
+  });
+
+  // API: Get current user's learning personalization profile (auth required)
+  app.get('/api/user/learning-profile', requireAuth, (req: AuthenticatedRequest, res) => {
+    const currentDb = loadDb(dbPath);
+    const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
+    if (!account) {
+      return res.status(404).json({ error: 'Account not found.' });
+    }
+    return res.json({
+      learningProfile: normalizeLearningProfile(account.user.learningProfile),
+    });
+  });
+
+  // API: Update/skip/clear current user's learning personalization profile (auth + CSRF + strict validation)
+  app.put('/api/user/learning-profile', requireAuth, async (req: AuthenticatedRequest, res) => {
+    const clientIp = resolveClientIp(req);
+    const rateCheck = rateLimiters.checkExploreAllowed(req.auth!.userId, clientIp);
+    if (!rateCheck.allowed) {
+      res.setHeader('Retry-After', String(rateCheck.resetInSec));
+      return res.status(429).json({
+        error: `Too many preference updates. Please wait ${rateCheck.resetInSec}s before trying again.`,
+        retryAfterSec: rateCheck.resetInSec,
+      });
+    }
+
+    const outcome = await withDbLock(dbPath, () => {
+      const currentDb = loadDb(dbPath);
+      const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
+      if (!account) {
+        return { errorStatus: 404, error: 'Account not found.' };
+      }
+
+      const validated = validateLearningProfileUpdate(
+        req.body,
+        account.user.learningProfile
+      );
+      if (validated.ok === false) {
+        return { errorStatus: validated.status, error: validated.error };
+      }
+
+      account.user.learningProfile = validated.profile;
+      saveDb(currentDb, dbPath);
+
+      return {
+        learningProfile: validated.profile,
+        user: sanitizeSelfUser(account.user),
+      };
+    });
+
+    if ('errorStatus' in outcome) {
+      return res.status(outcome.errorStatus).json({ error: outcome.error });
+    }
+    return res.json(outcome);
   });
 
   // API: Sanitized Curriculum & Practical Labs (zero answer keys or validation regexes)

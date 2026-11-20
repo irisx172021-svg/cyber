@@ -23,6 +23,8 @@ import {
   CapstoneStageCheckResponse,
   CapstoneSubmitResponse,
   PublicCapstonesPayload,
+  LearningExperienceLevel,
+  LearningProfile,
 } from '../types';
 
 const CSRF_HEADER_NAME = 'X-CSRF-Token';
@@ -404,6 +406,31 @@ export async function apiSyncProgress(): Promise<{
   });
   if (!res.ok) {
     await handleError(res, 'Failed to synchronize metrics');
+  }
+  return res.json();
+}
+
+export async function apiGetLearningProfile(): Promise<{ learningProfile: LearningProfile }> {
+  const res = await apiFetch('/api/user/learning-profile');
+  if (!res.ok) {
+    await handleError(res, 'Failed to load learning preferences');
+  }
+  return res.json();
+}
+
+export async function apiUpdateLearningProfile(payload: {
+  action?: 'save' | 'skip' | 'clear';
+  interests?: string[];
+  experienceLevel?: LearningExperienceLevel;
+  goals?: string;
+  onboardingCompleted?: boolean;
+}): Promise<{ learningProfile: LearningProfile; user: User }> {
+  const res = await apiFetch('/api/user/learning-profile', {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    await handleError(res, 'Failed to update learning preferences');
   }
   return res.json();
 }

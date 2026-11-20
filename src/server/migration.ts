@@ -43,6 +43,7 @@ import {
   pruneRevokedSessions,
   RevokedSessionRecord,
 } from './auth';
+import { normalizeLearningProfile } from '../lib/learningProfile';
 
 export const QUIZ_XP_PER_QUESTION = 100;
 export const HOMEWORK_XP_REWARD = 200;
@@ -178,6 +179,12 @@ export function migrateDatabaseSchema(rawDb: any, curriculum: Tier[]): Migration
     }
     if (typeof acc.tokenVersion !== 'number') {
       acc.tokenVersion = 1;
+    }
+    const prevProfileJson = JSON.stringify(acc.user.learningProfile ?? null);
+    const normalizedProfile = normalizeLearningProfile(acc.user.learningProfile);
+    if (prevProfileJson !== JSON.stringify(normalizedProfile)) {
+      acc.user.learningProfile = normalizedProfile;
+      changed = true;
     }
 
     const xpBefore = typeof acc.user.xp === 'number' ? acc.user.xp : (acc.progress?.xp ?? 0);

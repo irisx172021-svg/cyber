@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { PublicDirectoryUser, User } from '../types';
+import { normalizeLearningProfile } from '../lib/learningProfile';
 
 export const SESSION_TOKEN_PREFIX = 'cfa1';
 export const DEFAULT_SESSION_TTL_SECONDS = 60 * 60 * 24; // 24 hours
@@ -702,5 +703,6 @@ export function sanitizeSelfUser(user: User): User {
     followers: [...(user.followers || [])],
     lastStreakUpdate: user.lastStreakUpdate ?? null,
     lastActiveTimestamp: user.lastActiveTimestamp ?? null,
+    learningProfile: normalizeLearningProfile(user.learningProfile),
   };
 }

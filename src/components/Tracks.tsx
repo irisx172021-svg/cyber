@@ -6,45 +6,90 @@ import {
   Clock,
   ArrowRight,
   Lock,
+  Compass,
+  Layers,
 } from 'lucide-react';
-import { Tier, UserProgress, User, PracticalLab } from '../types';
+import {
+  Tier,
+  UserProgress,
+  User,
+  PracticalLab,
+  CapstoneProgressMap,
+  LearningProfile,
+} from '../types';
 import {
   getCanonicalCompletedSet,
   getMissingPrerequisites,
   getRecommendedPrerequisiteInfos,
   isLessonUnlocked,
 } from '../lib/curriculumProgress';
+import JourneyPage from './journey/JourneyPage';
 
 interface TracksProps {
   curriculum: Tier[];
   labsByLesson: Record<string, PracticalLab>;
   progress: UserProgress;
+  capstoneProgress?: CapstoneProgressMap;
   setActiveTab: (tab: string) => void;
   setSelectedLessonId: (id: string) => void;
   user: User | null;
   onLoginRequired: () => void;
   selectedTierId?: string;
   onSelectTierId?: (tierId: string) => void;
+  viewMode?: 'journey' | 'tiers';
+  onChangeViewMode?: (mode: 'journey' | 'tiers') => void;
+  selectedStageId?: string;
+  onSelectStageId?: (stageId: string) => void;
+  onOpenCapstones?: () => void;
+  learningProfile?: LearningProfile;
+  onOpenPreferencesModal?: () => void;
+  onSkipOnboarding?: () => Promise<void> | void;
+  onClearInterests?: () => Promise<void> | void;
 }
 
 export default function Tracks({
   curriculum,
   labsByLesson,
   progress,
+  capstoneProgress = {},
   setActiveTab,
   setSelectedLessonId,
   user,
   onLoginRequired,
   selectedTierId: controlledTierId,
   onSelectTierId,
+  viewMode: controlledViewMode,
+  onChangeViewMode,
+  selectedStageId,
+  onSelectStageId,
+  onOpenCapstones,
+  learningProfile,
+  onOpenPreferencesModal,
+  onSkipOnboarding,
+  onClearInterests,
 }: TracksProps) {
   const [internalTierId, setInternalTierId] = useState<string>(controlledTierId || 'tier-1');
+  const [internalViewMode, setInternalViewMode] = useState<'journey' | 'tiers'>(
+    controlledViewMode || 'journey'
+  );
 
   useEffect(() => {
     if (controlledTierId) {
       setInternalTierId(controlledTierId);
     }
   }, [controlledTierId]);
+
+  useEffect(() => {
+    if (controlledViewMode) {
+      setInternalViewMode(controlledViewMode);
+    }
+  }, [controlledViewMode]);
+
+  const viewMode = controlledViewMode || internalViewMode;
+  const setViewMode = (mode: 'journey' | 'tiers') => {
+    setInternalViewMode(mode);
+    if (onChangeViewMode) onChangeViewMode(mode);
+  };
 
   const selectedTierId = controlledTierId || internalTierId;
   const setSelectedTierId = (id: string) => {
@@ -53,10 +98,6 @@ export default function Tracks({
   };
 
   const activeTier = curriculum.find((tier) => tier.id === selectedTierId) || curriculum[0];
-
-  if (!activeTier) {
-    return null;
-  }
 
   const handleLessonLaunch = (lessonId: string) => {
     if (!user) {
@@ -87,6 +128,83 @@ export default function Tracks({
     };
   };
 
+  const renderViewToggle = () => (
+    <div
+      role="tablist"
+      aria-label="Curriculum view mode"
+      className="inline-flex items-center gap-1 p-1 rounded-lg border border-slate-800 bg-slate-900/80 shrink-0 self-start sm:self-auto"
+    >
+      <button
+        type="button"
+        role="tab"
+        aria-selected={viewMode === 'journey'}
+        onClick={() => setViewMode('journey')}
+        className={`min-h-[38px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 ${
+          viewMode === 'journey'
+            ? 'bg-sky-500 text-slate-950 font-semibold'
+            : 'text-slate-300 hover:text-slate-100 hover:bg-slate-800/70'
+        }`}
+      >
+        <Compass className="h-3.5 w-3.5 shrink-0" />
+        Journey Map
+      </button>
+      <button
+        type="button"
+        role="tab"
+        aria-selected={viewMode === 'tiers'}
+        onClick={() => setViewMode('tiers')}
+        className={`min-h-[38px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 ${
+          viewMode === 'tiers'
+            ? 'bg-sky-500 text-slate-950 font-semibold'
+            : 'text-slate-300 hover:text-slate-100 hover:bg-slate-800/70'
+        }`}
+      >
+        <Layers className="h-3.5 w-3.5 shrink-0" />
+        Classic 11 Tiers
+      </button>
+    </div>
+  );
+
+  if (viewMode === 'journey') {
+    return (
+      <div className="flex-1 overflow-y-auto px-4 py-6 sm:px-8 sm:py-8 bg-slate-950 text-slate-100">
+        <div className="max-w-6xl mx-auto space-y-5">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="text-xs text-slate-400">
+              <span className="font-medium text-sky-400">Academy Curriculum</span>
+              <span className="mx-2 text-slate-600" aria-hidden="true">
+                ·
+              </span>
+              <span>5-Stage Learning Journey mapped across all {curriculum.length} canonical tiers</span>
+            </div>
+            {renderViewToggle()}
+          </div>
+
+          <JourneyPage
+            curriculum={curriculum}
+            labsByLesson={labsByLesson}
+            progress={progress}
+            capstoneProgress={capstoneProgress}
+            user={user}
+            learningProfile={learningProfile}
+            onLaunchLesson={handleLessonLaunch}
+            onOpenCapstones={onOpenCapstones || (() => setActiveTab('capstones'))}
+            onSwitchToClassicTiers={() => setViewMode('tiers')}
+            onOpenPreferencesModal={onOpenPreferencesModal}
+            onSkipOnboarding={onSkipOnboarding}
+            onClearInterests={onClearInterests}
+            selectedStageId={selectedStageId}
+            onSelectStageId={onSelectStageId}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  if (!activeTier) {
+    return null;
+  }
+
   const activeStats = getTierCompletion(activeTier);
   const completedExercises = progress.completedExerciseIds || [];
 
@@ -94,14 +212,17 @@ export default function Tracks({
     <div className="flex-1 overflow-y-auto px-4 py-6 sm:px-8 sm:py-8 bg-slate-950 text-slate-100">
       <div className="max-w-6xl mx-auto space-y-6">
         {/* Header */}
-        <div className="border-b border-slate-800/80 pb-5 space-y-1">
-          <p className="text-xs font-medium text-sky-400">Academy Curriculum</p>
-          <h2 className="text-2xl font-semibold tracking-tight text-slate-100">
-            Learning Tracks
-          </h2>
-          <p className="text-sm text-slate-400">
-            Explore all {curriculum.length} tiers—from computer & networking foundations through defense, offense, cloud, reverse engineering, and career readiness.
-          </p>
+        <div className="border-b border-slate-800/80 pb-5 flex flex-col sm:flex-row sm:items-end justify-between gap-4">
+          <div className="space-y-1">
+            <p className="text-xs font-medium text-sky-400">Academy Curriculum</p>
+            <h2 className="text-2xl font-semibold tracking-tight text-slate-100">
+              Learning Tracks (Classic 11 Tiers)
+            </h2>
+            <p className="text-sm text-slate-400">
+              Explore all {curriculum.length} tiers—from computer & networking foundations through defense, offense, cloud, reverse engineering, and career readiness.
+            </p>
+          </div>
+          {renderViewToggle()}
         </div>
 
         {/* Compact Horizontal Tier Switcher */}

@@ -18,12 +18,17 @@ import {
   LabNote,
   PracticalLab,
   CapstoneProgressMap,
+  LearningProfile,
 } from '../types';
 import {
   computeCurriculumStats,
-  getCanonicalCompletedSet,
   getNextRecommendedLesson,
 } from '../lib/curriculumProgress';
+import {
+  computeAllStageStats,
+  JourneyStageStatus,
+} from '../lib/journeyProgress';
+import { computePersonalizedRecommendations } from '../lib/learningRecommendations';
 
 interface DashboardProps {
   user: User;
@@ -36,7 +41,18 @@ interface DashboardProps {
   setActiveTab: (tab: string) => void;
   setSelectedLessonId: (id: string) => void;
   onSelectTier?: (tierId: string) => void;
+  onSelectStage?: (stageId: string) => void;
+  onBrowseClassicTiers?: () => void;
+  learningProfile?: LearningProfile;
+  onOpenPreferencesModal?: () => void;
 }
+
+const DASHBOARD_STAGE_STATUS: Record<JourneyStageStatus, string> = {
+  completed: 'Completed',
+  in_progress: 'In Progress',
+  available: 'Ready',
+  locked_preview: 'Preview',
+};
 
 export default function Dashboard({
   user,
@@ -49,47 +65,44 @@ export default function Dashboard({
   setActiveTab,
   setSelectedLessonId,
   onSelectTier,
+  onSelectStage,
+  onBrowseClassicTiers,
+  learningProfile,
+  onOpenPreferencesModal,
 }: DashboardProps) {
   const completedCapstonesCount = Object.values(capstoneProgress).filter((c) =>
     Boolean(c?.completedAt)
   ).length;
   const stats = computeCurriculumStats(curriculum, progress);
-  const completedSet = getCanonicalCompletedSet(progress, curriculum);
+  const stageStatsList = React.useMemo(
+    () => computeAllStageStats(curriculum, labsByLesson, progress, capstoneProgress),
+    [curriculum, labsByLesson, progress, capstoneProgress]
+  );
+  const recommendations = React.useMemo(
+    () => computePersonalizedRecommendations(learningProfile, curriculum, progress, capstoneProgress),
+    [learningProfile, curriculum, progress, capstoneProgress]
+  );
   const totalLessons = stats.totalLessons;
   const completedCount = stats.completedLessons;
   const completedLabsCount = (progress.completedExerciseIds || []).length;
   const totalLabsCount = Object.keys(labsByLesson).length;
   const completionPercent = stats.completionPercent;
 
-  // Next unlocked recommended lesson
+  // Next unlocked recommended lesson (personalized if interests are set and an unlocked step is available)
+  const personalizedTopAction = recommendations.recommendedNextActions[0];
   const nextLessonInfo = getNextRecommendedLesson(curriculum, progress);
-  const nextLab = nextLessonInfo ? labsByLesson[nextLessonInfo.lesson.id] : undefined;
+  const effectiveNextLesson = personalizedTopAction?.lesson || nextLessonInfo?.lesson;
+  const effectiveNextLab = effectiveNextLesson ? labsByLesson[effectiveNextLesson.id] : undefined;
 
   const handleResume = () => {
-    if (nextLessonInfo) {
-      setSelectedLessonId(nextLessonInfo.lesson.id);
+    if (effectiveNextLesson) {
+      setSelectedLessonId(effectiveNextLesson.id);
       setActiveTab('player');
     }
   };
 
   const todayStr = new Date().toISOString().split('T')[0];
   const isStreakCheckedToday = progress.lastActiveDate === todayStr;
-
-  const getTierStats = (tier: Tier) => {
-    let total = 0;
-    let done = 0;
-    tier.topics.forEach((topic) => {
-      topic.lessons.forEach((lesson) => {
-        total++;
-        if (completedSet.has(lesson.id)) done++;
-      });
-    });
-    return {
-      done,
-      total,
-      percent: total > 0 ? Math.round((done / total) * 100) : 0,
-    };
-  };
 
   return (
     <div className="flex-1 overflow-y-auto px-4 py-6 sm:px-8 sm:py-8 bg-slate-950 text-slate-100">
@@ -104,6 +117,37 @@ export default function Dashboard({
             <p className="text-sm text-slate-400">
               Continue through all {curriculum.length} tiers with interactive practical labs, quizzes, and guided AI tutoring.
             </p>
+            {onOpenPreferencesModal && (
+              <div className="pt-1 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs text-slate-400">
+                {recommendations.isPersonalized ? (
+                  <>
+                    <span className="text-sky-400 font-medium">Your Interests:</span>
+                    <span className="text-slate-300">
+                      {recommendations.selectedPathways.map((p) => p.title).join(' · ')}
+                    </span>
+                    <span aria-hidden="true">·</span>
+                    <button
+                      type="button"
+                      onClick={onOpenPreferencesModal}
+                      className="text-sky-400 hover:text-sky-300 underline underline-offset-2"
+                    >
+                      Change Interests
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <span>Want tailored pathway highlights?</span>
+                    <button
+                      type="button"
+                      onClick={onOpenPreferencesModal}
+                      className="text-sky-400 hover:text-sky-300 underline underline-offset-2 font-medium"
+                    >
+                      Personalize Interests
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
           </div>
 
           <div className="flex items-center gap-2.5 text-xs shrink-0">
@@ -125,43 +169,59 @@ export default function Dashboard({
         </div>
 
         {/* Focal Action Card: Continue Learning */}
-        {nextLessonInfo && (
+        {effectiveNextLesson && (
           <section className="rounded-xl border border-slate-800 bg-slate-900/60 p-5 sm:p-6 flex flex-col lg:flex-row lg:items-center justify-between gap-6">
             <div className="space-y-2.5 max-w-2xl">
               <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-400">
-                <span className="text-sky-400 font-medium">Continue Learning</span>
-                <span>·</span>
-                <span>
-                  Tier {nextLessonInfo.tierNumber}: {nextLessonInfo.tierTitle}
+                <span className="text-sky-400 font-medium">
+                  {personalizedTopAction ? 'Recommended Next Step' : 'Continue Learning'}
                 </span>
                 <span>·</span>
-                <span>{nextLessonInfo.topicTitle}</span>
+                {personalizedTopAction ? (
+                  <>
+                    <span>
+                      Stage {personalizedTopAction.stageOrder}: {personalizedTopAction.stageTitle}
+                    </span>
+                    <span>·</span>
+                    <span>{personalizedTopAction.journeyTopicTitle}</span>
+                  </>
+                ) : (
+                  nextLessonInfo && (
+                    <>
+                      <span>
+                        Tier {nextLessonInfo.tierNumber}: {nextLessonInfo.tierTitle}
+                      </span>
+                      <span>·</span>
+                      <span>{nextLessonInfo.topicTitle}</span>
+                    </>
+                  )
+                )}
               </div>
 
               <h3 className="text-xl font-semibold text-slate-100 tracking-tight">
-                {nextLessonInfo.lesson.title}
+                {effectiveNextLesson.title}
               </h3>
 
               <p className="text-sm text-slate-300 leading-relaxed">
-                {nextLessonInfo.lesson.description}
+                {personalizedTopAction ? personalizedTopAction.reason : effectiveNextLesson.description}
               </p>
 
               <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-400 pt-1 tabular-nums">
                 <span className="inline-flex items-center gap-1.5">
                   <Clock className="h-3.5 w-3.5 text-slate-400" />
-                  {nextLessonInfo.lesson.duration}
+                  {effectiveNextLesson.duration}
                 </span>
-                {nextLab && (
+                {effectiveNextLab && (
                   <>
                     <span>·</span>
                     <span className="inline-flex items-center gap-1.5">
                       <FlaskConical className="h-3.5 w-3.5 text-sky-400" />
-                      Practical Lab (+{nextLab.xpReward} XP)
+                      Practical Lab (+{effectiveNextLab.xpReward} XP)
                     </span>
                   </>
                 )}
                 <span>·</span>
-                <span>Quiz (+{nextLessonInfo.lesson.quiz.length * 100} XP)</span>
+                <span>Quiz (+{effectiveNextLesson.quiz.length * 100} XP)</span>
               </div>
             </div>
 
@@ -222,53 +282,102 @@ export default function Dashboard({
           </div>
         </section>
 
-        {/* Tier Progress Overview (All 11 Tiers) */}
+        {/* 5-Stage Learning Journey Overview */}
         <section className="space-y-3">
-          <div className="flex items-center justify-between gap-2">
-            <h3 className="text-sm font-semibold text-slate-100">Curriculum Progress</h3>
-            <button
-              type="button"
-              onClick={() => setActiveTab('tracks')}
-              className="text-xs font-medium text-sky-400 hover:text-sky-300 inline-flex items-center gap-1 whitespace-nowrap shrink-0"
-            >
-              Browse All Tiers
-              <ArrowRight className="h-3.5 w-3.5" />
-            </button>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h3 className="text-sm font-semibold text-slate-100">
+                5-Stage Cybersecurity Journey
+              </h3>
+              <p className="text-xs text-slate-400">
+                Follow the guided 5-stage sequence or switch to Classic 11 Tiers anytime.
+              </p>
+            </div>
+            <div className="flex items-center gap-4">
+              <button
+                type="button"
+                onClick={() => {
+                  if (onBrowseClassicTiers) {
+                    onBrowseClassicTiers();
+                  } else if (onSelectTier && curriculum[0]) {
+                    onSelectTier(curriculum[0].id);
+                    setActiveTab('tracks');
+                  } else {
+                    setActiveTab('tracks');
+                  }
+                }}
+                className="text-xs font-medium text-slate-400 hover:text-slate-200 whitespace-nowrap shrink-0"
+              >
+                Classic 11 Tiers
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const activeStage =
+                    stageStatsList.find((s) => s.status === 'in_progress') || stageStatsList[0];
+                  if (onSelectStage && activeStage) {
+                    onSelectStage(activeStage.stage.id);
+                  }
+                  setActiveTab('tracks');
+                }}
+                className="text-xs font-medium text-sky-400 hover:text-sky-300 inline-flex items-center gap-1 whitespace-nowrap shrink-0"
+              >
+                Open Journey
+                <ArrowRight className="h-3.5 w-3.5" />
+              </button>
+            </div>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-            {curriculum.map((tier) => {
-              const stats = getTierStats(tier);
-              return (
-                <button
-                  key={tier.id}
-                  type="button"
-                  onClick={() => {
-                    if (onSelectTier) onSelectTier(tier.id);
-                    setActiveTab('tracks');
-                  }}
-                  className="text-left rounded-xl border border-slate-800/80 bg-slate-900/40 hover:bg-slate-900 hover:border-slate-700 p-4 transition-colors space-y-2.5"
-                >
-                  <div className="flex items-baseline justify-between gap-2">
-                    <span className="text-xs font-mono text-slate-400">Tier {tier.number}</span>
-                    <span className="text-xs font-mono tabular-nums text-slate-300">
-                      {stats.done}/{stats.total}
-                    </span>
-                  </div>
-                  <div className="text-sm font-medium text-slate-100 truncate">
-                    {tier.title}
-                  </div>
-                  <div className="h-1 w-full bg-slate-800 rounded-full overflow-hidden">
-                    <div
-                      className={`h-full rounded-full transition-all duration-500 ${
-                        stats.percent === 100 ? 'bg-emerald-400' : 'bg-sky-400'
-                      }`}
-                      style={{ width: `${stats.percent}%` }}
-                    />
-                  </div>
-                </button>
-              );
-            })}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+            {stageStatsList.map((s) => (
+              <button
+                key={s.stage.id}
+                type="button"
+                onClick={() => {
+                  if (onSelectStage) onSelectStage(s.stage.id);
+                  setActiveTab('tracks');
+                }}
+                className={`text-left rounded-xl border p-4 transition-colors space-y-2.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 ${
+                  s.status === 'in_progress'
+                    ? 'border-sky-500/45 bg-slate-900/65 hover:bg-slate-900'
+                    : 'border-slate-800/80 bg-slate-900/40 hover:bg-slate-900 hover:border-slate-700'
+                }`}
+              >
+                <div className="flex items-baseline justify-between gap-2 text-xs tabular-nums">
+                  <span className="font-mono text-sky-400">Stage {s.stage.order}</span>
+                  <span className="font-mono text-slate-300">
+                    {s.coreCompleted}/{s.coreTotal}
+                  </span>
+                </div>
+                <div className="text-sm font-medium text-slate-100 truncate">
+                  {s.stage.title}
+                </div>
+                <div className="h-1 w-full bg-slate-800 rounded-full overflow-hidden">
+                  <div
+                    className={`h-full rounded-full transition-all duration-500 ${
+                      s.status === 'completed' ? 'bg-emerald-400' : 'bg-sky-400'
+                    }`}
+                    style={{ width: `${s.corePercent}%` }}
+                  />
+                </div>
+                <div className="flex items-center justify-between text-[11px] text-slate-400 tabular-nums">
+                  <span
+                    className={
+                      s.status === 'completed'
+                        ? 'text-emerald-400'
+                        : s.status === 'in_progress'
+                        ? 'text-sky-400'
+                        : s.status === 'locked_preview'
+                        ? 'text-amber-300'
+                        : 'text-slate-400'
+                    }
+                  >
+                    {DASHBOARD_STAGE_STATUS[s.status]}
+                  </span>
+                  <span>{s.corePercent}% core</span>
+                </div>
+              </button>
+            ))}
           </div>
         </section>
 
