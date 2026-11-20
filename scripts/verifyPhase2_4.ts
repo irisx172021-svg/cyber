@@ -219,12 +219,12 @@ async function runTests() {
   });
 
   // Explicit flexible terminal command variations
-  const linLogLab = getPracticalLabForLesson('linux-log-filtering')!;
-  assert.ok(matchTerminalCommand(linLogLab, "grep -i 'Failed password' /var/log/auth.log"), 'Failed quoted grep match');
-  assert.ok(matchTerminalCommand(linLogLab, 'grep -i "Failed password" /var/log/auth.log'), 'Failed double-quoted grep match');
-  const netPortsLab = getPracticalLabForLesson('net-ports')!;
-  assert.ok(matchTerminalCommand(netPortsLab, 'ss -nlut'), 'Failed reordered POSIX flags ss -nlut');
-  assert.ok(matchTerminalCommand(netPortsLab, 'ss -t -u -l -n'), 'Failed separated POSIX flags ss -t -u -l -n');
+  const malwareLab = getPracticalLabForLesson('malware-triage')!;
+  assert.ok(matchTerminalCommand(malwareLab, "strings sample_dropper.bin | grep -iE 'http|virtualalloc'"), 'Failed single-quoted grep pipe match');
+  assert.ok(matchTerminalCommand(malwareLab, 'strings sample_dropper.bin | grep -iE "http|virtualalloc"'), 'Failed double-quoted grep pipe match');
+  const transportLab = getPracticalLabForLesson('transport-protocols')!;
+  assert.ok(matchTerminalCommand(transportLab, 'ss -nlut'), 'Failed reordered POSIX flags ss -nlut');
+  assert.ok(matchTerminalCommand(transportLab, 'ss -t -u -l -n'), 'Failed separated POSIX flags ss -t -u -l -n');
   const linFsLab = getPracticalLabForLesson('lin-fs')!;
   assert.ok(matchTerminalCommand(linFsLab, 'ls -l -a /etc'), 'Failed separated flags ls -l -a /etc');
   assert.ok(matchTerminalCommand(linFsLab, 'pwd'), 'Failed pwd');
@@ -479,11 +479,11 @@ async function runTests() {
     assert.equal(goodScen.data.scenarioResult.verified, true);
     assert.ok(goodScen.data.scenarioResult.lineRationales?.[String(winLab.artifactHighlightLines![0])]);
 
-    await unlockLessonAndCompleteLab(client, 'linux-log-filtering', completed, lessonIdx);
-    const linLogLabObj = getPracticalLabForLesson('linux-log-filtering')!;
+    await unlockLessonAndCompleteLab(client, 'lin-logfiltering', completed, lessonIdx);
+    const linLogLabObj = getPracticalLabForLesson('lin-logfiltering')!;
     const benignEntry = linLogLabObj.logEntries!.find((e) => !e.isSuspicious)!;
     const benignRes = await client.request('POST', '/api/assessments/verify-log', {
-      lessonId: 'linux-log-filtering',
+      lessonId: 'lin-logfiltering',
       labId: linLogLabObj.id,
       entryId: benignEntry.id,
     });
@@ -493,7 +493,7 @@ async function runTests() {
     assert.equal(benignRes.data.correlationSummary, undefined);
 
     const targetRes = await client.request('POST', '/api/assessments/verify-log', {
-      lessonId: 'linux-log-filtering',
+      lessonId: 'lin-logfiltering',
       labId: linLogLabObj.id,
       entryId: linLogLabObj.suspiciousEntryId,
     });
@@ -551,13 +551,17 @@ async function runTests() {
     });
     assert.equal(briefReport.status, 400);
 
-    // Submit strong grounded report covering rubric keywords
-    const strongReportSections = Object.fromEntries(
-      capA.deliverableTemplate.sections.map((s) => [
-        s.key,
-        `Incident investigation findings: Password spray against m.patel from 198.51.100.77 succeeded with Event ID 4624 logon and 4625 failures, followed by suspicious PowerShell encodedcommand / Win32_Process / rundll32 staging under svchost.exe and lsass access indicators. Remediation: reset compromised session/password, isolate wkst-fin-14 containment host, enforce MFA Conditional Access, lockout threshold, and Windows Event Log Sysmon Script Block Logging monitoring.`,
-      ])
-    );
+    // Submit strong grounded report covering Capstone A evidence & rubric keywords
+    const strongReportSections = {
+      executiveSummary:
+        'External RDP access (LogonType 10 over TCP 3389) targeted host WKSTN-FIN-09 using service account svc_payroll from external source IP 185.220.101.44.',
+      timeline:
+        'At 02:12:41Z Event 4624 showed svc_payroll RDP logon; at 02:14:52Z rdpinit.exe launched hidden encoded PowerShell spawning collector.exe staging m.dat, followed at 02:15:30Z by high-entropy DNS TXT C2 queries to sync-cdn-health.example.',
+      impactAssessment:
+        'Staging activity under C:\\Users\\Public\\staging\\m.dat and LSASS credential cache exposure require forensic memory and disk preservation rather than blind wiping.',
+      remediation:
+        'Quarantine WKSTN-FIN-09 immediately via EDR isolation, block external TCP/3389 RDP behind VPN and MFA, reset svc_payroll credentials and Kerberos TGTs, and DNS sinkhole sync-cdn-health.example.',
+    };
     const submitPass = await client.request('POST', `/api/capstones/${capA.id}/submit`, {
       sections: strongReportSections,
     });
