@@ -1,6 +1,0 @@
-{
-  "name": "CyberFoundations Academy",
-  "description": "An elite cybersecurity training academy featuring interactive curriculum tracks, immediate-validation labs, interactive lesson playback, and community forum.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
