@@ -9,6 +9,11 @@ import { getPracticalLabForLesson } from '../src/data/practicalLabs';
 import { isScryptHash } from '../src/server/auth';
 import { DbSchema } from '../src/server/migration';
 import { TestCookieClient } from './testHttpClient';
+import {
+  assertLiveDbUnchanged,
+  snapshotFileSha256,
+  writeBaselineFixtureCopy,
+} from './testFixtures';
 
 function getFreePort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -57,6 +62,7 @@ async function waitForServerReady(baseUrl: string, timeoutMs = 15000): Promise<v
 
 async function runTests() {
   const rootDir = process.cwd();
+  const preRunLiveSha = snapshotFileSha256(path.join(rootDir, 'database.json'));
   const distDir = path.join(rootDir, 'dist');
   const clientDistDir = path.join(distDir, 'client');
   const serverDistFile = path.join(distDir, 'server', 'server.cjs');
@@ -124,7 +130,7 @@ async function runTests() {
   // 4. Spawn ACTUAL compiled production server (node dist/server/server.cjs) on isolated DB copy
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfa-p19a-prod-'));
   const tmpDbPath = path.join(tmpDir, 'database.json');
-  fs.copyFileSync(path.join(rootDir, 'backups', 'pre-phase1', 'database.test-copy.json'), tmpDbPath);
+  writeBaselineFixtureCopy(tmpDbPath);
 
   const port = await getFreePort();
   const baseUrl = `http://127.0.0.1:${port}`;
@@ -306,13 +312,9 @@ async function runTests() {
 
     console.log('[PASS][Production HTTP Tests]', JSON.stringify(httpResults, null, 2));
 
-    // 5. Confirm production database.json integrity
-    const prodDb = JSON.parse(fs.readFileSync(path.join(rootDir, 'database.json'), 'utf-8')) as DbSchema;
-    assert.equal(prodDb.accounts.length, 6);
-    for (const acc of prodDb.accounts) {
-      assert.equal(isScryptHash(acc.passwordHash), true);
-    }
-    console.log('[PASS][Database Preservation] All 6 production accounts intact with scrypt hashes');
+    // 5. Confirm live database.json integrity
+    const liveCheck = assertLiveDbUnchanged(preRunLiveSha, rootDir);
+    console.log(`[PASS][Database Preservation] All ${liveCheck.accountsCount} live accounts intact with scrypt hashes & unchanged SHA-256`);
   } catch (err) {
     console.error('Production stdout:\n', stdoutLogs);
     console.error('Production stderr:\n', stderrLogs);

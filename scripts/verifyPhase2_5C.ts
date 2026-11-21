@@ -74,14 +74,83 @@ async function runTests() {
   // =========================================================================
   // 1 & 3. EXISTING ACCOUNT MIGRATION & IDEMPOTENCY (ZERO DATA LOSS)
   // =========================================================================
-  const liveDbRaw = JSON.parse(fs.readFileSync(path.join(rootDir, 'database.json'), 'utf-8'));
-  const v1SampleRaw = JSON.parse(
-    fs.readFileSync(path.join(rootDir, 'backups', 'pre-phase1', 'database.test-copy.json'), 'utf-8')
-  );
+  const liveDbPath = path.join(rootDir, 'database.json');
+  const preRunLiveBytes = fs.readFileSync(liveDbPath);
+  const preRunLiveHash = crypto.createHash('sha256').update(preRunLiveBytes).digest('hex');
+  const liveDbRaw = JSON.parse(preRunLiveBytes.toString('utf-8'));
 
-  // Verify live v2 accounts + v1 backup migrate cleanly and idempotently
+  // Self-contained isolated pre-v2 fixture with two accounts (one customized profile, one lacking profile)
+  const v1SampleRaw = {
+    schemaVersion: 1,
+    accounts: [
+      {
+        email: 'fixture-custom@test.local',
+        passwordHash: liveDbRaw.accounts[0].passwordHash,
+        tokenVersion: 1,
+        user: {
+          id: 'usr-fixture-custom',
+          username: '@FixtureCustom',
+          email: 'fixture-custom@test.local',
+          xp: 1250,
+          streak: 5,
+          level: 3,
+          rank: 'System Operator',
+          completion: 1,
+          verifiedTopics: ['net-osi-tcp'],
+          following: [],
+          followers: [],
+          lastActiveDate: '2026-11-19',
+        },
+        progress: {
+          schemaVersion: 1,
+          completedLessonIds: ['net-osi-tcp'],
+          completedExerciseIds: [],
+          completedQuizLessonIds: [],
+          completedHomeworkLessonIds: [],
+          xp: 1250,
+          streak: 5,
+          lastActiveDate: '2026-11-19',
+        },
+        labNotes: [],
+      },
+      {
+        email: 'fixture-default@test.local',
+        passwordHash: liveDbRaw.accounts[0].passwordHash,
+        tokenVersion: 1,
+        user: {
+          id: 'usr-fixture-default',
+          username: '@FixtureDefault',
+          email: 'fixture-default@test.local',
+          xp: 0,
+          streak: 0,
+          level: 1,
+          rank: 'Cadet',
+          completion: 0,
+          verifiedTopics: [],
+          following: [],
+          followers: [],
+          lastActiveDate: null,
+        },
+        progress: {
+          schemaVersion: 1,
+          completedLessonIds: [],
+          completedExerciseIds: [],
+          completedQuizLessonIds: [],
+          completedHomeworkLessonIds: [],
+          xp: 0,
+          streak: 0,
+          lastActiveDate: null,
+        },
+        labNotes: [],
+      },
+    ],
+    posts: [],
+    timelineEvents: [],
+    groups: [],
+  };
+
+  // Verify live accounts (mix of default and customized profiles) migrate without losing XP, notes, or customized preferences
   const mig1Live = migrateDatabaseSchema(liveDbRaw, ACADEMY_CURRICULUM);
-  assert.equal(mig1Live.changed, true, 'First migration pass initializes missing learningProfile');
   assert.equal(mig1Live.db.accounts.length, liveDbRaw.accounts.length);
   for (let i = 0; i < liveDbRaw.accounts.length; i++) {
     const before = liveDbRaw.accounts[i];
@@ -94,10 +163,17 @@ async function runTests() {
       'Migration must preserve completedLessonIds'
     );
     assert.deepEqual(after.labNotes, before.labNotes, 'Migration must preserve labNotes');
-    assert.ok(after.user.learningProfile, 'Account must have default learningProfile');
-    assert.deepEqual(after.user.learningProfile.interests, []);
-    assert.equal(after.user.learningProfile.experienceLevel, 'beginner');
-    assert.equal(after.user.learningProfile.onboardingCompleted, false);
+    assert.ok(after.user.learningProfile, 'Account must have normalized learningProfile');
+
+    if (before.user.learningProfile) {
+      assert.deepEqual(
+        after.user.learningProfile,
+        normalizeLearningProfile(before.user.learningProfile),
+        'Migration must preserve existing customized learningProfile without resetting preferences'
+      );
+    } else {
+      assert.deepEqual(after.user.learningProfile, createDefaultLearningProfile());
+    }
   }
   assert.deepEqual(mig1Live.db.posts, liveDbRaw.posts, 'Posts preserved');
   assert.deepEqual(mig1Live.db.groups, liveDbRaw.groups, 'Groups preserved');
@@ -106,17 +182,37 @@ async function runTests() {
   const mig2Live = migrateDatabaseSchema(mig1Live.db, ACADEMY_CURRICULUM);
   assert.equal(mig2Live.changed, false, 'Second migration pass must be a no-op');
 
-  // Verify legacy pre-phase1 DB also migrates cleanly & idempotently
-  const mig1Legacy = migrateDatabaseSchema(v1SampleRaw, ACADEMY_CURRICULUM);
-  assert.equal(mig1Legacy.changed, true);
-  assert.ok(mig1Legacy.db.accounts.every((a) => Boolean(a.user.learningProfile)));
-  const mig2Legacy = migrateDatabaseSchema(mig1Legacy.db, ACADEMY_CURRICULUM);
-  assert.equal(mig2Legacy.changed, false, 'Legacy migration pass 2 must be idempotent');
+  // Verify isolated custom profile fixture is preserved verbatim across repeated migrations
+  const customFixture = JSON.parse(JSON.stringify(v1SampleRaw));
+  const expectedCustomProfile: LearningProfile = {
+    interests: ['pathway-soc-detection', 'pathway-dfir'],
+    experienceLevel: 'experienced',
+    goals: 'Strengthen incident response and log triage depth',
+    onboardingCompleted: true,
+    updatedAt: '2026-11-20T00:00:00.000Z',
+  };
+  customFixture.accounts[0].user.learningProfile = { ...expectedCustomProfile };
+  const mig1Fixture = migrateDatabaseSchema(customFixture, ACADEMY_CURRICULUM);
+  assert.equal(mig1Fixture.changed, true, 'Fixture accounts lacking profiles initialize defaults');
+  assert.deepEqual(
+    mig1Fixture.db.accounts[0].user.learningProfile,
+    expectedCustomProfile,
+    'Custom learningProfile must remain intact after migration'
+  );
+  for (let i = 1; i < mig1Fixture.db.accounts.length; i++) {
+    assert.deepEqual(
+      mig1Fixture.db.accounts[i].user.learningProfile,
+      createDefaultLearningProfile(),
+      'Accounts without learningProfile initialize defaults'
+    );
+  }
+  const mig2Fixture = migrateDatabaseSchema(mig1Fixture.db, ACADEMY_CURRICULUM);
+  assert.equal(mig2Fixture.changed, false, 'Fixture migration pass 2 must be idempotent');
 
   pass(
     'Migration & Schema',
-    'Check 1 & 3: Existing Users Migrate Cleanly & Idempotently',
-    `Verified ${liveDbRaw.accounts.length} live accounts and legacy test DB preserve XP/streaks/notes/posts/groups with idempotent pass 2`
+    'Check 1 & 3: Default & Customized Profiles Migrate Cleanly & Idempotently',
+    `Verified ${liveDbRaw.accounts.length} live accounts and isolated default/customized fixtures preserve XP/streaks/notes/posts/groups/profiles idempotently`
   );
 
   // =========================================================================
@@ -124,7 +220,7 @@ async function runTests() {
   // =========================================================================
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfa-p25c-test-'));
   const tmpDbPath = path.join(tmpDir, 'database.json');
-  fs.copyFileSync(path.join(rootDir, 'database.json'), tmpDbPath);
+  fs.writeFileSync(tmpDbPath, JSON.stringify(mig1Fixture.db, null, 2), 'utf-8');
 
   const srv = await startTempServer(tmpDbPath);
   try {
@@ -445,15 +541,28 @@ async function runTests() {
   );
 
   // =========================================================================
-  // 15 & 16: PUBLIC PAYLOADS, CLASSIC COMPATIBILITY, DB SHA-256 & BUNDLE SECURITY
+  // 15 & 16: PUBLIC PAYLOADS, CLASSIC COMPATIBILITY, LIVE DB ISOLATION & BUNDLE SECURITY
   // =========================================================================
-  const liveDbBytes = fs.readFileSync(path.join(rootDir, 'database.json'));
-  const backupDbBytes = fs.readFileSync(
-    path.join(rootDir, 'backups', 'pre-phase2.5c-20261120-050600', 'database.json')
+  const postRunLiveBytes = fs.readFileSync(liveDbPath);
+  const postRunLiveHash = crypto.createHash('sha256').update(postRunLiveBytes).digest('hex');
+  assert.equal(
+    postRunLiveHash,
+    preRunLiveHash,
+    'Tests must execute in isolated tmpDir and never mutate live database.json'
   );
-  const liveHash = crypto.createHash('sha256').update(liveDbBytes).digest('hex');
-  const backupHash = crypto.createHash('sha256').update(backupDbBytes).digest('hex');
-  assert.equal(liveHash, backupHash, 'Live database.json must remain untouched (byte-for-byte identical)');
+
+  const optionalBackupPath = path.join(rootDir, 'backups', 'pre-phase2.5c-20261120-050600', 'database.json');
+  const backupStatus = fs.existsSync(optionalBackupPath)
+    ? (() => {
+        const bh = crypto.createHash('sha256').update(fs.readFileSync(optionalBackupPath)).digest('hex');
+        assert.equal(
+          bh,
+          'd94730b1aad0ae5434c29d23832e3ab77740fe8705fef0ce0d28dd99bd5485a3',
+          'Protected pre-Phase 2.5C backup must remain byte-for-byte intact if present'
+        );
+        return `backup intact (${bh})`;
+      })()
+    : 'untracked backups/ absent on container (isolated before/after fixture verified)';
 
   // Scan dist/client bundle to ensure zero leaked server answers, rubrics, or solutions
   const distClientDir = path.join(rootDir, 'dist', 'client');
@@ -507,8 +616,8 @@ async function runTests() {
 
   pass(
     'Bundle & Data Integrity',
-    'Checks 15 & 16: Live DB SHA-256, Classic 11 Tiers & Zero Client Secret Leakage',
-    `Verified database.json SHA-256 (${liveHash}) and ${distFiles.length} client bundle files clean`
+    'Checks 15 & 16: Live DB Isolation, Classic 11 Tiers & Zero Client Secret Leakage',
+    `Verified live database.json unchanged (${postRunLiveHash}), ${backupStatus}, and ${distFiles.length} client bundle files clean`
   );
 
   console.log(`\nALL ${results.length} PHASE 2.5C VERIFICATION SUITES PASSED.`);

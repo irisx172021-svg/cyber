@@ -9,6 +9,11 @@ import { DEFAULT_TIMELINE_EVENTS, DEFAULT_COMMUNITY_POSTS } from '../src/data/in
 import { hashPasswordSync } from '../src/server/auth';
 import { CreateApiAppOptions } from '../server';
 import { TestCookieClient } from './testHttpClient';
+import {
+  assertLiveDbUnchanged,
+  createLegacyPre19bGroupFixture,
+  snapshotFileSha256,
+} from './testFixtures';
 
 process.env.CFA_NO_LISTEN = '1';
 
@@ -200,6 +205,7 @@ async function login(baseUrl: string, email: string): Promise<TestCookieClient> 
 
 async function runTests() {
   const rootDir = process.cwd();
+  const preRunLiveSha = snapshotFileSha256(path.join(rootDir, 'database.json'));
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfa-19b-'));
 
   const pass = (category: string, name: string, detail: string) => {
@@ -210,9 +216,7 @@ async function runTests() {
     // =========================================================================
     // 1. CONSERVATIVE LEGACY MIGRATION & DATA PRESERVATION
     // =========================================================================
-    const pre19bBackup = path.join(rootDir, 'backups', 'pre-phase1.9b', 'database.pre-phase1.9b.json');
-    assert.ok(fs.existsSync(pre19bBackup), 'Expected pre-phase1.9b backup database file');
-    const originalSnapshot = JSON.parse(fs.readFileSync(pre19bBackup, 'utf-8')) as DbSchema;
+    const originalSnapshot = createLegacyPre19bGroupFixture() as DbSchema;
 
     const migrationTestDb = JSON.parse(JSON.stringify(originalSnapshot)) as DbSchema;
     assert.equal(
@@ -947,10 +951,10 @@ async function runTests() {
     }
 
     // =========================================================================
-    // 4. VERIFY REAL SERVER MIGRATION ON ISOLATED COPY OF PRODUCTION DATABASE
+    // 4. VERIFY REAL SERVER MIGRATION ON ISOLATED LEGACY SNAPSHOT COPY
     // =========================================================================
     const liveCopyPath = path.join(tmpDir, 'prod-copy.json');
-    fs.copyFileSync(pre19bBackup, liveCopyPath);
+    fs.writeFileSync(liveCopyPath, JSON.stringify(originalSnapshot, null, 2), 'utf-8');
     const liveSrv = await startTempServer(liveCopyPath);
     try {
       // Trigger loadDb migration by registering/logging in or checking migrated JSON
@@ -972,6 +976,7 @@ async function runTests() {
       await new Promise<void>((resolve) => liveSrv.server.close(() => resolve()));
     }
 
+    assertLiveDbUnchanged(preRunLiveSha, rootDir);
     console.log('\n=== Phase 1.9B Group Privacy Verification Summary: ALL PASSED ===');
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });

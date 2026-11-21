@@ -111,6 +111,14 @@ import {
   normalizeLearningProfile,
   validateLearningProfileUpdate,
 } from './src/lib/learningProfile.ts';
+import type { Pool } from 'pg';
+import { createMaintenanceWriteFreezeMiddleware } from './src/server/cutoverGuard.ts';
+import {
+  PgStorageUnavailableError,
+  PostgresStore,
+  resolveStorageBackend,
+  StorageBackend,
+} from './src/server/postgresStore.ts';
 
 const DEFAULT_DB_PATH = path.join(process.cwd(), 'database.json');
 
@@ -123,6 +131,12 @@ export interface CreateApiAppOptions {
   trustedPreview?: boolean;
   frameAncestors?: string;
   rateLimits?: RateLimitPolicyConfig;
+  maintenanceWriteFreeze?: () => boolean;
+  storageBackend?: StorageBackend;
+  postgresStore?: PostgresStore;
+  postgresPool?: Pool;
+  databaseUrl?: string;
+  skipPgBranchCheck?: boolean;
 }
 
 interface AuthenticatedContext {
@@ -131,7 +145,10 @@ interface AuthenticatedContext {
   exp: number;
 }
 
-type AuthenticatedRequest = Request & { auth?: AuthenticatedContext };
+type AuthenticatedRequest = Request & {
+  auth?: AuthenticatedContext;
+  authAccount?: AccountRecord;
+};
 
 // Helper to load DB safely with corrupt-file preservation and idempotent v1->v2 migration
 export function loadDb(dbPath = DEFAULT_DB_PATH): DbSchema {
@@ -322,15 +339,36 @@ export function saveDb(data: DbSchema, dbPath = DEFAULT_DB_PATH) {
   saveDbAtomic(data, dbPath);
 }
 
-export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOptions) {
-  // Fail closed at startup if session secret or CSP framing configuration is invalid
+export function createApiApp(rawDbPath?: string, options?: CreateApiAppOptions) {
+  const hasExplicitDbPath = typeof rawDbPath === 'string' && rawDbPath.trim().length > 0;
+  const dbPath = hasExplicitDbPath ? rawDbPath : DEFAULT_DB_PATH;
+  const storageBackend = resolveStorageBackend({
+    explicitBackend: options?.storageBackend,
+    hasExplicitDbPath,
+  });
+
+  // Fail closed at startup if session secret, storage backend, or CSP framing configuration is invalid
   const resolvedSecret = resolveSessionSecret(options?.sessionSecret);
   const framingPolicy = resolveFramingPolicy({
     trustedPreview: options?.trustedPreview,
     frameAncestors: options?.frameAncestors,
   });
 
+  const pgStore: PostgresStore | null =
+    storageBackend === 'postgres'
+      ? options?.postgresStore ??
+        new PostgresStore({
+          pool: options?.postgresPool,
+          databaseUrl: options?.databaseUrl,
+          skipBranchCheck: options?.skipPgBranchCheck,
+        })
+      : null;
+
   const app = express();
+  app.locals.storageBackend = storageBackend;
+  if (pgStore) {
+    app.locals.pgStore = pgStore;
+  }
   app.disable('x-powered-by');
   const trustProxyConfig = resolveTrustProxyConfig(options?.trustProxy);
   app.set('trust proxy', trustProxyConfig);
@@ -371,8 +409,21 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
   const rateLimiters = createSecurityRateLimiters(options?.rateLimits);
   const trustedOriginsConfig = buildConfiguredTrustedOrigins(options?.trustedOrigins);
 
-  // Initialize DB (runs safe idempotent schema migration if needed)
-  loadDb(dbPath);
+  const sendStorageError = (res: Response, err: unknown, fallbackMessage = 'Internal server error.') => {
+    if (err instanceof PgStorageUnavailableError) {
+      return res.status(503).json({ error: 'Database service temporarily unavailable.' });
+    }
+    return res.status(500).json({ error: fallbackMessage });
+  };
+
+  // Initialize JSON DB only when storageBackend === 'json' (never fall back silently from PostgreSQL)
+  if (storageBackend === 'json') {
+    loadDb(dbPath);
+  }
+
+  if (options?.maintenanceWriteFreeze) {
+    app.use('/api', createMaintenanceWriteFreezeMiddleware(options.maintenanceWriteFreeze));
+  }
 
   const STATE_CHANGING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
   const DISALLOWED_FORM_MIME_TYPES = [
@@ -416,11 +467,12 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
     return next();
   });
 
-  const authenticateCookieSession = (
+  const authenticateCookieSession = async (
     req: Request
-  ):
+  ): Promise<
     | { ok: true; auth: AuthenticatedContext; account: AccountRecord }
-    | { ok: false; status: number; error: string } => {
+    | { ok: false; status: number; error: string }
+  > => {
     const token = extractSessionCookie(req.headers['cookie']);
     if (!token) {
       return { ok: false, status: 401, error: 'Authentication session required.' };
@@ -433,6 +485,33 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
           ? 'Session has expired. Please sign in again.'
           : 'Invalid authentication session.';
       return { ok: false, status: 401, error: msg };
+    }
+
+    if (pgStore) {
+      try {
+        const pgAuth = await pgStore.authenticateSession(
+          verified.payload.sid,
+          verified.payload.sub,
+          verified.payload.ver
+        );
+        if (pgAuth.ok === false) {
+          return pgAuth;
+        }
+        return {
+          ok: true,
+          auth: {
+            userId: pgAuth.account.user.id,
+            sid: verified.payload.sid,
+            exp: verified.payload.exp,
+          },
+          account: pgAuth.account,
+        };
+      } catch (err) {
+        if (err instanceof PgStorageUnavailableError) {
+          return { ok: false, status: 503, error: 'Database service temporarily unavailable.' };
+        }
+        return { ok: false, status: 500, error: 'Database unavailable.' };
+      }
     }
 
     let currentDb: DbSchema;
@@ -471,13 +550,14 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
     };
   };
 
-  const requireAuth = (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
-    const authRes = authenticateCookieSession(req);
+  const requireAuth = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    const authRes = await authenticateCookieSession(req);
     if (authRes.ok === false) {
       return res.status(authRes.status).json({ error: authRes.error });
     }
 
     req.auth = authRes.auth;
+    req.authAccount = authRes.account;
 
     // CSRF defense layer 2: require session-bound X-CSRF-Token on every state-changing authenticated request
     if (STATE_CHANGING_METHODS.has(req.method.toUpperCase())) {
@@ -492,7 +572,7 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
     return next();
   };
 
-  const verifyPreAuthOrActiveCsrf = (req: Request): boolean => {
+  const verifyPreAuthOrActiveCsrf = async (req: Request): Promise<boolean> => {
     const csrfHeader = req.get(CSRF_HEADER_NAME);
     if (!csrfHeader) return false;
 
@@ -505,7 +585,7 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
     }
 
     // Also allow if caller already has an active session cookie and valid session-bound CSRF token
-    const sessionCheck = authenticateCookieSession(req);
+    const sessionCheck = await authenticateCookieSession(req);
     if (sessionCheck.ok) {
       return verifyCsrfToken(csrfHeader, sessionCheck.auth.sid, { secret: resolvedSecret });
     }
@@ -514,8 +594,8 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
   };
 
   // API: Initialize or retrieve CSRF token (safe GET, zero DB/session state changes)
-  app.get('/api/auth/csrf', (req, res) => {
-    const sessionCheck = authenticateCookieSession(req);
+  app.get('/api/auth/csrf', async (req, res) => {
+    const sessionCheck = await authenticateCookieSession(req);
     if (sessionCheck.ok) {
       return res.json({
         csrfToken: createCsrfToken(sessionCheck.auth.sid, { secret: resolvedSecret }),
@@ -557,7 +637,7 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
   // API: Register (IP throttled + Origin/CSRF protected + HttpOnly session cookie)
   app.post('/api/auth/register', async (req, res) => {
     try {
-      if (!verifyPreAuthOrActiveCsrf(req)) {
+      if (!(await verifyPreAuthOrActiveCsrf(req))) {
         return res.status(403).json({
           error: 'Invalid or missing CSRF verification token for registration.',
         });
@@ -610,82 +690,105 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
 
       const hashedPassword = await hashPassword(password);
 
-      const result = await withDbLock(dbPath, () => {
-        const currentDb = loadDb(dbPath);
+      const result = pgStore
+        ? await (async () => {
+            const pgReg = await pgStore.registerAccount({
+              trimmedEmail,
+              formattedUsername,
+              passwordHash: hashedPassword,
+              learningProfile: createDefaultLearningProfile(),
+            });
+            if (pgReg.ok === false) {
+              return { errorStatus: pgReg.status, error: pgReg.error };
+            }
+            const issued = issueSessionToken(pgReg.user.id, {
+              secret: resolvedSecret,
+              ttlSeconds: options?.sessionTtlSeconds,
+              tokenVersion: 1,
+            });
+            return {
+              issued,
+              expiresAt: issued.payload.exp * 1000,
+              user: sanitizeSelfUser(pgReg.user),
+              progress: pgReg.progress,
+            };
+          })()
+        : await withDbLock(dbPath, () => {
+            const currentDb = loadDb(dbPath);
 
-        const emailExists = currentDb.accounts.some(
-          (acc) => acc.email.toLowerCase() === trimmedEmail
-        );
-        const usernameExists = currentDb.accounts.some(
-          (acc) => acc.user.username.toLowerCase() === formattedUsername.toLowerCase()
-        );
+            const emailExists = currentDb.accounts.some(
+              (acc) => acc.email.toLowerCase() === trimmedEmail
+            );
+            const usernameExists = currentDb.accounts.some(
+              (acc) => acc.user.username.toLowerCase() === formattedUsername.toLowerCase()
+            );
 
-        if (emailExists || usernameExists) {
-          return {
-            errorStatus: 409,
-            error:
-              'Registration could not be completed with the provided details. Please verify your inputs or sign in.',
-          };
-        }
+            if (emailExists || usernameExists) {
+              return {
+                errorStatus: 409,
+                error:
+                  'Registration could not be completed with the provided details. Please verify your inputs or sign in.',
+              };
+            }
 
-        const newUser: User = {
-          id: `usr-${Math.random().toString(36).substring(2, 11)}`,
-          username: formattedUsername,
-          email: email.trim(),
-          streak: 0,
-          lastActiveDate: null,
-          xp: 0,
-          rank: 'Cadet',
-          level: 1,
-          completion: 0,
-          verifiedTopics: [],
-          following: [],
-          followers: [],
-          lastStreakUpdate: null,
-          lastActiveTimestamp: null,
-          learningProfile: createDefaultLearningProfile(),
-        };
+            const newUser: User = {
+              id: `usr-${Math.random().toString(36).substring(2, 11)}`,
+              username: formattedUsername,
+              email: email.trim(),
+              streak: 0,
+              lastActiveDate: null,
+              xp: 0,
+              rank: 'Cadet',
+              level: 1,
+              completion: 0,
+              verifiedTopics: [],
+              following: [],
+              followers: [],
+              lastStreakUpdate: null,
+              lastActiveTimestamp: null,
+              learningProfile: createDefaultLearningProfile(),
+            };
 
-        const newProgress: UserProgress = {
-          schemaVersion: CURRENT_PROGRESS_SCHEMA_VERSION,
-          completedLessonIds: [],
-          completedExerciseIds: [],
-          completedQuizLessonIds: [],
-          completedHomeworkLessonIds: [],
-          legacyCompletedLessonIds: [],
-          awardedXpEventIds: [],
-          xp: 0,
-          streak: 0,
-          lastActiveDate: null,
-          lastStreakUpdate: null,
-          lastActiveTimestamp: null,
-          updatedAt: new Date().toISOString(),
-        };
+            const newProgress: UserProgress = {
+              schemaVersion: CURRENT_PROGRESS_SCHEMA_VERSION,
+              completedLessonIds: [],
+              completedExerciseIds: [],
+              completedQuizLessonIds: [],
+              completedHomeworkLessonIds: [],
+              legacyCompletedLessonIds: [],
+              awardedXpEventIds: [],
+              xp: 0,
+              streak: 0,
+              lastActiveDate: null,
+              lastStreakUpdate: null,
+              lastActiveTimestamp: null,
+              updatedAt: new Date().toISOString(),
+            };
 
-        currentDb.accounts.push({
-          email: trimmedEmail,
-          passwordHash: hashedPassword,
-          tokenVersion: 1,
-          user: newUser,
-          progress: newProgress,
-          labNotes: [],
-        });
+            currentDb.accounts.push({
+              email: trimmedEmail,
+              passwordHash: hashedPassword,
+              tokenVersion: 1,
+              user: newUser,
+              progress: newProgress,
+              labNotes: [],
+            });
 
-        saveDb(currentDb, dbPath);
+            saveDb(currentDb, dbPath);
 
-        const issued = issueSessionToken(newUser.id, {
-          secret: resolvedSecret,
-          ttlSeconds: options?.sessionTtlSeconds,
-          tokenVersion: 1,
-        });
+            const issued = issueSessionToken(newUser.id, {
+              secret: resolvedSecret,
+              ttlSeconds: options?.sessionTtlSeconds,
+              tokenVersion: 1,
+            });
 
-        return {
-          issued,
-          expiresAt: issued.payload.exp * 1000,
-          user: sanitizeSelfUser(newUser),
-          progress: newProgress,
-        };
-      });
+            return {
+              issued,
+              expiresAt: issued.payload.exp * 1000,
+              user: sanitizeSelfUser(newUser),
+              progress: newProgress,
+            };
+          });
 
       if ('errorStatus' in result) {
         return res.status(result.errorStatus).json({ error: result.error });
@@ -715,15 +818,15 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
         capstoneProgress: {},
         csrfToken: createCsrfToken(result.issued.payload.sid, { secret: resolvedSecret }),
       });
-    } catch {
-      return res.status(500).json({ error: 'Registration failed due to a server error.' });
+    } catch (err) {
+      return sendStorageError(res, err, 'Registration failed due to a server error.');
     }
   });
 
   // API: Login (Origin/CSRF protected + IP & progressive cooldown + constant-time work + HttpOnly session cookie)
   app.post('/api/auth/login', async (req, res) => {
     try {
-      if (!verifyPreAuthOrActiveCsrf(req)) {
+      if (!(await verifyPreAuthOrActiveCsrf(req))) {
         return res.status(403).json({
           error: 'Invalid or missing CSRF verification token for login.',
         });
@@ -746,56 +849,84 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
         });
       }
 
-      const authOutcome = await withDbLock(dbPath, async () => {
-        const currentDb = loadDb(dbPath);
-        const match = currentDb.accounts.find((acc) => {
-          const accEmail = acc.email.toLowerCase().trim();
-          const accUser = acc.user.username.toLowerCase().trim();
-          return (
-            accEmail === normalizedInput ||
-            accUser === normalizedInput ||
-            accUser === '@' + normalizedInput ||
-            '@' + accUser === normalizedInput ||
-            accUser.replace('@', '') === normalizedInput
-          );
-        });
+      const authOutcome = pgStore
+        ? await (async () => {
+            const pgLogin = await pgStore.loginAccount(
+              normalizedInput,
+              password,
+              verifyPassword,
+              hashPassword
+            );
+            if (!pgLogin.authenticated) {
+              return { authenticated: false as const };
+            }
+            const match = pgLogin.account;
+            const issued = issueSessionToken(match.user.id, {
+              secret: resolvedSecret,
+              ttlSeconds: options?.sessionTtlSeconds,
+              tokenVersion: match.tokenVersion ?? 1,
+            });
+            return {
+              authenticated: true as const,
+              issued,
+              expiresAt: issued.payload.exp * 1000,
+              user: sanitizeSelfUser(match.user),
+              progress: match.progress,
+              labNotes: match.labNotes || [],
+              labExploration: getSanitizedLabExplorationForUser(match),
+              capstoneProgress: getSanitizedCapstoneProgressForUser(match),
+            };
+          })()
+        : await withDbLock(dbPath, async () => {
+            const currentDb = loadDb(dbPath);
+            const match = currentDb.accounts.find((acc) => {
+              const accEmail = acc.email.toLowerCase().trim();
+              const accUser = acc.user.username.toLowerCase().trim();
+              return (
+                accEmail === normalizedInput ||
+                accUser === normalizedInput ||
+                accUser === '@' + normalizedInput ||
+                '@' + accUser === normalizedInput ||
+                accUser.replace('@', '') === normalizedInput
+              );
+            });
 
-        if (!match) {
-          // Constant-work dummy scrypt verification to prevent timing-based user enumeration
-          await verifyPassword(password, DUMMY_SCRYPT_HASH);
-          return { authenticated: false as const };
-        }
+            if (!match) {
+              // Constant-work dummy scrypt verification to prevent timing-based user enumeration
+              await verifyPassword(password, DUMMY_SCRYPT_HASH);
+              return { authenticated: false as const };
+            }
 
-        const { valid, needsUpgrade } = await verifyPassword(password, match.passwordHash);
-        if (!valid) {
-          return { authenticated: false as const };
-        }
+            const { valid, needsUpgrade } = await verifyPassword(password, match.passwordHash);
+            if (!valid) {
+              return { authenticated: false as const };
+            }
 
-        if (needsUpgrade) {
-          match.passwordHash = await hashPassword(password);
-          if (typeof match.tokenVersion !== 'number') {
-            match.tokenVersion = 1;
-          }
-          saveDb(currentDb, dbPath);
-        }
+            if (needsUpgrade) {
+              match.passwordHash = await hashPassword(password);
+              if (typeof match.tokenVersion !== 'number') {
+                match.tokenVersion = 1;
+              }
+              saveDb(currentDb, dbPath);
+            }
 
-        const issued = issueSessionToken(match.user.id, {
-          secret: resolvedSecret,
-          ttlSeconds: options?.sessionTtlSeconds,
-          tokenVersion: match.tokenVersion ?? 1,
-        });
+            const issued = issueSessionToken(match.user.id, {
+              secret: resolvedSecret,
+              ttlSeconds: options?.sessionTtlSeconds,
+              tokenVersion: match.tokenVersion ?? 1,
+            });
 
-        return {
-          authenticated: true as const,
-          issued,
-          expiresAt: issued.payload.exp * 1000,
-          user: sanitizeSelfUser(match.user),
-          progress: match.progress,
-          labNotes: match.labNotes || [],
-          labExploration: getSanitizedLabExplorationForUser(match),
-          capstoneProgress: getSanitizedCapstoneProgressForUser(match),
-        };
-      });
+            return {
+              authenticated: true as const,
+              issued,
+              expiresAt: issued.payload.exp * 1000,
+              user: sanitizeSelfUser(match.user),
+              progress: match.progress,
+              labNotes: match.labNotes || [],
+              labExploration: getSanitizedLabExplorationForUser(match),
+              capstoneProgress: getSanitizedCapstoneProgressForUser(match),
+            };
+          });
 
       if (!authOutcome.authenticated) {
         rateLimiters.recordLoginFailure(clientIp, normalizedInput);
@@ -831,8 +962,8 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
         capstoneProgress: authOutcome.capstoneProgress,
         csrfToken: createCsrfToken(authOutcome.issued.payload.sid, { secret: resolvedSecret }),
       });
-    } catch {
-      return res.status(500).json({ error: 'Authentication failed due to a server error.' });
+    } catch (err) {
+      return sendStorageError(res, err, 'Authentication failed due to a server error.');
     }
   });
 
@@ -840,15 +971,19 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
   app.post('/api/auth/logout', requireAuth, async (req: AuthenticatedRequest, res) => {
     try {
       const auth = req.auth!;
-      await withDbLock(dbPath, () => {
-        const currentDb = loadDb(dbPath);
-        const active = pruneRevokedSessions(currentDb.revokedSessions);
-        if (!active.some((r) => r.sid === auth.sid)) {
-          active.push({ sid: auth.sid, exp: auth.exp });
-        }
-        currentDb.revokedSessions = active;
-        saveDb(currentDb, dbPath);
-      });
+      if (pgStore) {
+        await pgStore.revokeSession(auth.sid, auth.exp);
+      } else {
+        await withDbLock(dbPath, () => {
+          const currentDb = loadDb(dbPath);
+          const active = pruneRevokedSessions(currentDb.revokedSessions);
+          if (!active.some((r) => r.sid === auth.sid)) {
+            active.push({ sid: auth.sid, exp: auth.exp });
+          }
+          currentDb.revokedSessions = active;
+          saveDb(currentDb, dbPath);
+        });
+      }
 
       const cookiePolicy = getRequestCookiePolicy(req);
       res.clearCookie(SESSION_COOKIE_NAME, buildClearCookieOptions(cookiePolicy.secure, cookiePolicy));
@@ -857,32 +992,45 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
         buildClearCookieOptions(cookiePolicy.secure, cookiePolicy)
       );
       return res.json({ success: true });
-    } catch {
-      return res.status(500).json({ error: 'Failed to revoke session cleanly.' });
+    } catch (err) {
+      return sendStorageError(res, err, 'Failed to revoke session cleanly.');
     }
   });
 
   // API: Authenticated current user profile & session-bound CSRF token hydration
-  app.get('/api/auth/me', requireAuth, (req: AuthenticatedRequest, res) => {
-    const currentDb = loadDb(dbPath);
-    const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
-    if (!account) {
-      return res.status(404).json({ error: 'Account not found' });
+  app.get('/api/auth/me', requireAuth, async (req: AuthenticatedRequest, res) => {
+    try {
+      const account = pgStore
+        ? req.authAccount ?? (await pgStore.getAccountById(req.auth!.userId))
+        : loadDb(dbPath).accounts.find((acc) => acc.user.id === req.auth!.userId);
+      if (!account) {
+        return res.status(404).json({ error: 'Account not found' });
+      }
+      return res.json({
+        user: sanitizeSelfUser(account.user),
+        progress: account.progress,
+        labExploration: getSanitizedLabExplorationForUser(account),
+        capstoneProgress: getSanitizedCapstoneProgressForUser(account),
+        csrfToken: createCsrfToken(req.auth!.sid, { secret: resolvedSecret }),
+      });
+    } catch (err) {
+      return sendStorageError(res, err);
     }
-    return res.json({
-      user: sanitizeSelfUser(account.user),
-      progress: account.progress,
-      labExploration: getSanitizedLabExplorationForUser(account),
-      capstoneProgress: getSanitizedCapstoneProgressForUser(account),
-      csrfToken: createCsrfToken(req.auth!.sid, { secret: resolvedSecret }),
-    });
   });
 
   // API: Public Directory Users (never exposes account IDs, emails, or credentials)
-  app.get('/api/users', (_req, res) => {
-    const currentDb = loadDb(dbPath);
-    const publicUsers = currentDb.accounts.map((acc) => toPublicDirectoryUser(acc.user));
-    res.json(publicUsers);
+  app.get('/api/users', async (_req, res) => {
+    try {
+      if (pgStore) {
+        const publicUsers = await pgStore.getPublicDirectoryUsers();
+        return res.json(publicUsers);
+      }
+      const currentDb = loadDb(dbPath);
+      const publicUsers = currentDb.accounts.map((acc) => toPublicDirectoryUser(acc.user));
+      return res.json(publicUsers);
+    } catch (err) {
+      return sendStorageError(res, err);
+    }
   });
 
   // API: Follow/Unfollow User (validated + rate-limited)
@@ -902,99 +1050,139 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
       });
     }
 
-    const result = await withDbLock(dbPath, () => {
-      const currentDb = loadDb(dbPath);
-      const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
-      if (!account) {
-        return { errorStatus: 404, error: 'Account not found' };
+    try {
+      if (pgStore) {
+        const pgResult = await pgStore.toggleFollowUser(req.auth!.userId, targetUsername);
+        if (pgResult.ok === false) {
+          return res.status(pgResult.status).json({ error: pgResult.error });
+        }
+        return res.json({ following: pgResult.following });
       }
 
-      let cleanTarget = targetUsername.trim();
-      if (!cleanTarget.startsWith('@')) {
-        cleanTarget = '@' + cleanTarget;
+      const result = await withDbLock(dbPath, () => {
+        const currentDb = loadDb(dbPath);
+        const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
+        if (!account) {
+          return { errorStatus: 404, error: 'Account not found' };
+        }
+
+        let cleanTarget = targetUsername.trim();
+        if (!cleanTarget.startsWith('@')) {
+          cleanTarget = '@' + cleanTarget;
+        }
+
+        const targetAccount = currentDb.accounts.find(
+          (acc) => acc.user.username.toLowerCase() === cleanTarget.toLowerCase()
+        );
+        if (!targetAccount) {
+          return { errorStatus: 404, error: 'Target user not found.' };
+        }
+        if (targetAccount.user.id === account.user.id) {
+          return { errorStatus: 400, error: 'Cannot follow your own account.' };
+        }
+
+        const canonicalTarget = targetAccount.user.username;
+        const alreadyFollowing =
+          account.user.following.includes(canonicalTarget) ||
+          account.user.following.includes(targetUsername);
+        const updatedFollowing = alreadyFollowing
+          ? account.user.following.filter(
+              (u) => u.toLowerCase() !== canonicalTarget.toLowerCase() && u !== targetUsername
+            )
+          : [...account.user.following, canonicalTarget];
+
+        account.user.following = updatedFollowing;
+
+        if (!targetAccount.user.followers) {
+          targetAccount.user.followers = [];
+        }
+        const myUsername = account.user.username;
+        const alreadyFollowedByMe = targetAccount.user.followers.includes(myUsername);
+        if (alreadyFollowing) {
+          targetAccount.user.followers = targetAccount.user.followers.filter((u) => u !== myUsername);
+        } else if (!alreadyFollowedByMe) {
+          targetAccount.user.followers.push(myUsername);
+        }
+
+        saveDb(currentDb, dbPath);
+        return { following: updatedFollowing };
+      });
+
+      if ('errorStatus' in result) {
+        return res.status(result.errorStatus).json({ error: result.error });
       }
-
-      const targetAccount = currentDb.accounts.find(
-        (acc) => acc.user.username.toLowerCase() === cleanTarget.toLowerCase()
-      );
-      if (!targetAccount) {
-        return { errorStatus: 404, error: 'Target user not found.' };
-      }
-      if (targetAccount.user.id === account.user.id) {
-        return { errorStatus: 400, error: 'Cannot follow your own account.' };
-      }
-
-      const canonicalTarget = targetAccount.user.username;
-      const alreadyFollowing =
-        account.user.following.includes(canonicalTarget) ||
-        account.user.following.includes(targetUsername);
-      const updatedFollowing = alreadyFollowing
-        ? account.user.following.filter(
-            (u) => u.toLowerCase() !== canonicalTarget.toLowerCase() && u !== targetUsername
-          )
-        : [...account.user.following, canonicalTarget];
-
-      account.user.following = updatedFollowing;
-
-      if (!targetAccount.user.followers) {
-        targetAccount.user.followers = [];
-      }
-      const myUsername = account.user.username;
-      const alreadyFollowedByMe = targetAccount.user.followers.includes(myUsername);
-      if (alreadyFollowing) {
-        targetAccount.user.followers = targetAccount.user.followers.filter((u) => u !== myUsername);
-      } else if (!alreadyFollowedByMe) {
-        targetAccount.user.followers.push(myUsername);
-      }
-
-      saveDb(currentDb, dbPath);
-      return { following: updatedFollowing };
-    });
-
-    if ('errorStatus' in result) {
-      return res.status(result.errorStatus).json({ error: result.error });
+      return res.json(result);
+    } catch (err) {
+      return sendStorageError(res, err);
     }
-    return res.json(result);
   });
 
   // API: Sync Progress & User Metrics (strictly server-authoritative; rejects forged XP/streak/completion)
   app.post('/api/user/sync', requireAuth, async (req: AuthenticatedRequest, res) => {
-    const result = await withDbLock(dbPath, () => {
-      const currentDb = loadDb(dbPath);
-      const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
-      if (!account) {
-        return { errorStatus: 404, error: 'Account not found' };
+    try {
+      if (pgStore) {
+        const pgResult = await pgStore.syncUserProgress(req.auth!.userId, req.body);
+        if (pgResult.ok === false) {
+          return res.status(pgResult.status).json({ error: pgResult.error });
+        }
+        return res.json({
+          user: pgResult.user,
+          progress: pgResult.progress,
+          staleOverwritePrevented: pgResult.staleOverwritePrevented,
+        });
       }
 
-      const syncResult = applySafeProgressSync(account, req.body || {}, ACADEMY_CURRICULUM);
-      if (syncResult.ok === false) {
-        return { errorStatus: syncResult.status, error: syncResult.error };
+      const result = await withDbLock(dbPath, () => {
+        const currentDb = loadDb(dbPath);
+        const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
+        if (!account) {
+          return { errorStatus: 404, error: 'Account not found' };
+        }
+
+        const syncResult = applySafeProgressSync(account, req.body || {}, ACADEMY_CURRICULUM);
+        if (syncResult.ok === false) {
+          return { errorStatus: syncResult.status, error: syncResult.error };
+        }
+
+        saveDb(currentDb, dbPath);
+        return {
+          user: sanitizeSelfUser(account.user),
+          progress: account.progress,
+          staleOverwritePrevented: syncResult.staleOverwritePrevented,
+        };
+      });
+
+      if ('errorStatus' in result) {
+        return res.status(result.errorStatus).json({ error: result.error });
       }
-
-      saveDb(currentDb, dbPath);
-      return {
-        user: sanitizeSelfUser(account.user),
-        progress: account.progress,
-        staleOverwritePrevented: syncResult.staleOverwritePrevented,
-      };
-    });
-
-    if ('errorStatus' in result) {
-      return res.status(result.errorStatus).json({ error: result.error });
+      return res.json(result);
+    } catch (err) {
+      return sendStorageError(res, err);
     }
-    return res.json(result);
   });
 
   // API: Get current user's learning personalization profile (auth required)
-  app.get('/api/user/learning-profile', requireAuth, (req: AuthenticatedRequest, res) => {
-    const currentDb = loadDb(dbPath);
-    const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
-    if (!account) {
-      return res.status(404).json({ error: 'Account not found.' });
+  app.get('/api/user/learning-profile', requireAuth, async (req: AuthenticatedRequest, res) => {
+    try {
+      if (pgStore) {
+        const pgResult = await pgStore.getLearningProfile(req.auth!.userId);
+        if (pgResult.ok === false) {
+          return res.status(pgResult.status).json({ error: pgResult.error });
+        }
+        return res.json({ learningProfile: pgResult.learningProfile });
+      }
+
+      const currentDb = loadDb(dbPath);
+      const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
+      if (!account) {
+        return res.status(404).json({ error: 'Account not found.' });
+      }
+      return res.json({
+        learningProfile: normalizeLearningProfile(account.user.learningProfile),
+      });
+    } catch (err) {
+      return sendStorageError(res, err);
     }
-    return res.json({
-      learningProfile: normalizeLearningProfile(account.user.learningProfile),
-    });
   });
 
   // API: Update/skip/clear current user's learning personalization profile (auth + CSRF + strict validation)
@@ -1009,34 +1197,49 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
       });
     }
 
-    const outcome = await withDbLock(dbPath, () => {
-      const currentDb = loadDb(dbPath);
-      const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
-      if (!account) {
-        return { errorStatus: 404, error: 'Account not found.' };
+    try {
+      if (pgStore) {
+        const pgResult = await pgStore.updateLearningProfile(req.auth!.userId, req.body);
+        if (pgResult.ok === false) {
+          return res.status(pgResult.status).json({ error: pgResult.error });
+        }
+        return res.json({
+          learningProfile: pgResult.learningProfile,
+          user: pgResult.user,
+        });
       }
 
-      const validated = validateLearningProfileUpdate(
-        req.body,
-        account.user.learningProfile
-      );
-      if (validated.ok === false) {
-        return { errorStatus: validated.status, error: validated.error };
+      const outcome = await withDbLock(dbPath, () => {
+        const currentDb = loadDb(dbPath);
+        const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
+        if (!account) {
+          return { errorStatus: 404, error: 'Account not found.' };
+        }
+
+        const validated = validateLearningProfileUpdate(
+          req.body,
+          account.user.learningProfile
+        );
+        if (validated.ok === false) {
+          return { errorStatus: validated.status, error: validated.error };
+        }
+
+        account.user.learningProfile = validated.profile;
+        saveDb(currentDb, dbPath);
+
+        return {
+          learningProfile: validated.profile,
+          user: sanitizeSelfUser(account.user),
+        };
+      });
+
+      if ('errorStatus' in outcome) {
+        return res.status(outcome.errorStatus).json({ error: outcome.error });
       }
-
-      account.user.learningProfile = validated.profile;
-      saveDb(currentDb, dbPath);
-
-      return {
-        learningProfile: validated.profile,
-        user: sanitizeSelfUser(account.user),
-      };
-    });
-
-    if ('errorStatus' in outcome) {
-      return res.status(outcome.errorStatus).json({ error: outcome.error });
+      return res.json(outcome);
+    } catch (err) {
+      return sendStorageError(res, err);
     }
-    return res.json(outcome);
   });
 
   // API: Sanitized Curriculum & Practical Labs (zero answer keys or validation regexes)
@@ -1045,16 +1248,20 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
   });
 
   // API: Sanitized Guided Capstones (+ authenticated per-user capstoneProgress if logged in)
-  app.get('/api/capstones', (req, res) => {
-    const payload = getPublicCapstonesPayload();
-    const authCheck = authenticateCookieSession(req);
-    const capstoneProgress = authCheck.ok
-      ? getSanitizedCapstoneProgressForUser(authCheck.account)
-      : {};
-    return res.json({
-      ...payload,
-      capstoneProgress,
-    });
+  app.get('/api/capstones', async (req, res) => {
+    try {
+      const payload = getPublicCapstonesPayload();
+      const authCheck = await authenticateCookieSession(req);
+      const capstoneProgress = authCheck.ok
+        ? getSanitizedCapstoneProgressForUser(authCheck.account)
+        : {};
+      return res.json({
+        ...payload,
+        capstoneProgress,
+      });
+    } catch (err) {
+      return sendStorageError(res, err);
+    }
   });
 
   // API: Capstone Stage Evidence Verification
@@ -1070,53 +1277,68 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
     }
 
     const { stageId, artifactId, selectedLines } = req.body || {};
-    const outcome = await withDbLock(dbPath, () => {
-      const currentDb = loadDb(dbPath);
-      const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
-      if (!account) {
-        return { status: 404, body: { error: 'Account not found.' } };
+    try {
+      if (pgStore) {
+        const pgOutcome = await pgStore.verifyCapstoneEvidence(
+          req.auth!.userId,
+          req.params.capstoneId,
+          stageId,
+          artifactId,
+          selectedLines
+        );
+        return res.status(pgOutcome.status).json(pgOutcome.body);
       }
 
-      const result = processCapstoneEvidenceVerification(
-        account,
-        req.params.capstoneId,
-        stageId,
-        artifactId,
-        selectedLines
-      );
-      if (result.ok === false) {
+      const outcome = await withDbLock(dbPath, () => {
+        const currentDb = loadDb(dbPath);
+        const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
+        if (!account) {
+          return { status: 404, body: { error: 'Account not found.' } };
+        }
+
+        const result = processCapstoneEvidenceVerification(
+          account,
+          req.params.capstoneId,
+          stageId,
+          artifactId,
+          selectedLines
+        );
+        if (result.ok === false) {
+          return {
+            status: result.status,
+            body: {
+              error: result.error,
+              ...(result.missingPrerequisites ? { missingPrerequisites: result.missingPrerequisites } : {}),
+            },
+          };
+        }
+
+        if (result.dbChanged) {
+          if (result.timelineAction && result.data.xpAwarded > 0) {
+            currentDb.timelineEvents.unshift({
+              id: `ev-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+              username: account.user.username,
+              action: result.timelineAction,
+              xpReward: result.data.xpAwarded,
+              timestamp: new Date().toISOString(),
+            });
+          }
+          saveDb(currentDb, dbPath);
+        }
+
         return {
-          status: result.status,
+          status: 200,
           body: {
-            error: result.error,
-            ...(result.missingPrerequisites ? { missingPrerequisites: result.missingPrerequisites } : {}),
+            ...result.data,
+            ...(result.data.user ? { user: sanitizeSelfUser(result.data.user) } : {}),
           },
         };
-      }
+      });
 
-      if (result.dbChanged) {
-        if (result.timelineAction && result.data.xpAwarded > 0) {
-          currentDb.timelineEvents.unshift({
-            id: `ev-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-            username: account.user.username,
-            action: result.timelineAction,
-            xpReward: result.data.xpAwarded,
-            timestamp: new Date().toISOString(),
-          });
-        }
-        saveDb(currentDb, dbPath);
-      }
-
-      return {
-        status: 200,
-        body: {
-          ...result.data,
-          ...(result.data.user ? { user: sanitizeSelfUser(result.data.user) } : {}),
-        },
-      };
-    });
-
-    return res.status(outcome.status).json(outcome.body);
+      return res.status(outcome.status).json(outcome.body);
+    } catch (err) {
+      return sendStorageError(res, err);
+    }
   });
 
   // API: Capstone Stage Knowledge Check Verification
@@ -1132,52 +1354,66 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
     }
 
     const { stageId, selectedOption } = req.body || {};
-    const outcome = await withDbLock(dbPath, () => {
-      const currentDb = loadDb(dbPath);
-      const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
-      if (!account) {
-        return { status: 404, body: { error: 'Account not found.' } };
+    try {
+      if (pgStore) {
+        const pgOutcome = await pgStore.submitCapstoneStageCheck(
+          req.auth!.userId,
+          req.params.capstoneId,
+          stageId,
+          selectedOption
+        );
+        return res.status(pgOutcome.status).json(pgOutcome.body);
       }
 
-      const result = processCapstoneStageCheck(
-        account,
-        req.params.capstoneId,
-        stageId,
-        selectedOption
-      );
-      if (result.ok === false) {
+      const outcome = await withDbLock(dbPath, () => {
+        const currentDb = loadDb(dbPath);
+        const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
+        if (!account) {
+          return { status: 404, body: { error: 'Account not found.' } };
+        }
+
+        const result = processCapstoneStageCheck(
+          account,
+          req.params.capstoneId,
+          stageId,
+          selectedOption
+        );
+        if (result.ok === false) {
+          return {
+            status: result.status,
+            body: {
+              error: result.error,
+              ...(result.missingPrerequisites ? { missingPrerequisites: result.missingPrerequisites } : {}),
+            },
+          };
+        }
+
+        if (result.dbChanged) {
+          if (result.timelineAction && result.data.xpAwarded > 0) {
+            currentDb.timelineEvents.unshift({
+              id: `ev-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+              username: account.user.username,
+              action: result.timelineAction,
+              xpReward: result.data.xpAwarded,
+              timestamp: new Date().toISOString(),
+            });
+          }
+          saveDb(currentDb, dbPath);
+        }
+
         return {
-          status: result.status,
+          status: 200,
           body: {
-            error: result.error,
-            ...(result.missingPrerequisites ? { missingPrerequisites: result.missingPrerequisites } : {}),
+            ...result.data,
+            ...(result.data.user ? { user: sanitizeSelfUser(result.data.user) } : {}),
           },
         };
-      }
+      });
 
-      if (result.dbChanged) {
-        if (result.timelineAction && result.data.xpAwarded > 0) {
-          currentDb.timelineEvents.unshift({
-            id: `ev-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-            username: account.user.username,
-            action: result.timelineAction,
-            xpReward: result.data.xpAwarded,
-            timestamp: new Date().toISOString(),
-          });
-        }
-        saveDb(currentDb, dbPath);
-      }
-
-      return {
-        status: 200,
-        body: {
-          ...result.data,
-          ...(result.data.user ? { user: sanitizeSelfUser(result.data.user) } : {}),
-        },
-      };
-    });
-
-    return res.status(outcome.status).json(outcome.body);
+      return res.status(outcome.status).json(outcome.body);
+    } catch (err) {
+      return sendStorageError(res, err);
+    }
   });
 
   // API: Capstone Final Deliverable Submission & Server Rubric Grading
@@ -1193,51 +1429,64 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
     }
 
     const { sections } = req.body || {};
-    const outcome = await withDbLock(dbPath, () => {
-      const currentDb = loadDb(dbPath);
-      const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
-      if (!account) {
-        return { status: 404, body: { error: 'Account not found.' } };
+    try {
+      if (pgStore) {
+        const pgOutcome = await pgStore.submitCapstoneReport(
+          req.auth!.userId,
+          req.params.capstoneId,
+          sections
+        );
+        return res.status(pgOutcome.status).json(pgOutcome.body);
       }
 
-      const result = processCapstoneReportSubmission(
-        account,
-        req.params.capstoneId,
-        sections
-      );
-      if (result.ok === false) {
+      const outcome = await withDbLock(dbPath, () => {
+        const currentDb = loadDb(dbPath);
+        const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
+        if (!account) {
+          return { status: 404, body: { error: 'Account not found.' } };
+        }
+
+        const result = processCapstoneReportSubmission(
+          account,
+          req.params.capstoneId,
+          sections
+        );
+        if (result.ok === false) {
+          return {
+            status: result.status,
+            body: {
+              error: result.error,
+              ...(result.missingPrerequisites ? { missingPrerequisites: result.missingPrerequisites } : {}),
+            },
+          };
+        }
+
+        if (result.dbChanged) {
+          if (result.timelineAction && result.data.xpAwarded > 0) {
+            currentDb.timelineEvents.unshift({
+              id: `ev-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+              username: account.user.username,
+              action: result.timelineAction,
+              xpReward: result.data.xpAwarded,
+              timestamp: new Date().toISOString(),
+            });
+          }
+          saveDb(currentDb, dbPath);
+        }
+
         return {
-          status: result.status,
+          status: 200,
           body: {
-            error: result.error,
-            ...(result.missingPrerequisites ? { missingPrerequisites: result.missingPrerequisites } : {}),
+            ...result.data,
+            ...(result.data.user ? { user: sanitizeSelfUser(result.data.user) } : {}),
           },
         };
-      }
+      });
 
-      if (result.dbChanged) {
-        if (result.timelineAction && result.data.xpAwarded > 0) {
-          currentDb.timelineEvents.unshift({
-            id: `ev-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-            username: account.user.username,
-            action: result.timelineAction,
-            xpReward: result.data.xpAwarded,
-            timestamp: new Date().toISOString(),
-          });
-        }
-        saveDb(currentDb, dbPath);
-      }
-
-      return {
-        status: 200,
-        body: {
-          ...result.data,
-          ...(result.data.user ? { user: sanitizeSelfUser(result.data.user) } : {}),
-        },
-      };
-    });
-
-    return res.status(outcome.status).json(outcome.body);
+      return res.status(outcome.status).json(outcome.body);
+    } catch (err) {
+      return sendStorageError(res, err);
+    }
   });
 
   // API: Verify Log Investigation Target Server-Side (throttled per-user/IP, never exposes suspiciousEntryId)
@@ -1267,56 +1516,70 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
       return res.status(400).json({ error: 'Valid lessonId, labId, and entryId strings are required.' });
     }
 
-    const outcome = await withDbLock(dbPath, () => {
-      const currentDb = loadDb(dbPath);
-      const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
-      if (!account) {
-        return { status: 404, body: { error: 'Account not found.' } };
+    try {
+      if (pgStore) {
+        const pgOutcome = await pgStore.verifyLogInvestigation(
+          req.auth!.userId,
+          lessonId.trim(),
+          labId.trim(),
+          entryId.trim()
+        );
+        return res.status(pgOutcome.status).json(pgOutcome.body);
       }
 
-      const result = verifyLogInvestigationTarget(
-        lessonId.trim(),
-        labId.trim(),
-        entryId.trim(),
-        account.progress,
-        ACADEMY_CURRICULUM
-      );
+      const outcome = await withDbLock(dbPath, () => {
+        const currentDb = loadDb(dbPath);
+        const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
+        if (!account) {
+          return { status: 404, body: { error: 'Account not found.' } };
+        }
 
-      if (result.ok === false) {
+        const result = verifyLogInvestigationTarget(
+          lessonId.trim(),
+          labId.trim(),
+          entryId.trim(),
+          account.progress,
+          ACADEMY_CURRICULUM
+        );
+
+        if (result.ok === false) {
+          return {
+            status: result.status,
+            body: {
+              error: result.error,
+              ...(result.missingPrerequisites ? { missingPrerequisites: result.missingPrerequisites } : {}),
+            },
+          };
+        }
+
+        let explorationMeta: { explorationComplete: boolean } | null = null;
+        if (result.isTarget) {
+          const recorded = recordVerifiedLogInvestigation(account, result.lab, result.entryId);
+          explorationMeta = { explorationComplete: recorded.explorationComplete };
+          saveDb(currentDb, dbPath);
+        }
+
         return {
-          status: result.status,
+          status: 200,
           body: {
-            error: result.error,
-            ...(result.missingPrerequisites ? { missingPrerequisites: result.missingPrerequisites } : {}),
+            isTarget: result.isTarget,
+            message: result.message,
+            analysisNote: result.analysisNote,
+            ...(result.correlationSummary ? { correlationSummary: result.correlationSummary } : {}),
+            ...(explorationMeta
+              ? {
+                  explorationComplete: explorationMeta.explorationComplete,
+                  verifiedLogEntryId: result.entryId,
+                }
+              : {}),
           },
         };
-      }
+      });
 
-      let explorationMeta: { explorationComplete: boolean } | null = null;
-      if (result.isTarget) {
-        const recorded = recordVerifiedLogInvestigation(account, result.lab, result.entryId);
-        explorationMeta = { explorationComplete: recorded.explorationComplete };
-        saveDb(currentDb, dbPath);
-      }
-
-      return {
-        status: 200,
-        body: {
-          isTarget: result.isTarget,
-          message: result.message,
-          analysisNote: result.analysisNote,
-          ...(result.correlationSummary ? { correlationSummary: result.correlationSummary } : {}),
-          ...(explorationMeta
-            ? {
-                explorationComplete: explorationMeta.explorationComplete,
-                verifiedLogEntryId: result.entryId,
-              }
-            : {}),
-        },
-      };
-    });
-
-    return res.status(outcome.status).json(outcome.body);
+      return res.status(outcome.status).json(outcome.body);
+    } catch (err) {
+      return sendStorageError(res, err);
+    }
   });
 
   // API: Step 1 Practical Lab Exploration Tracking & Verification
@@ -1331,35 +1594,44 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
       });
     }
 
-    const outcome = await withDbLock(dbPath, () => {
-      const currentDb = loadDb(dbPath);
-      const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
-      if (!account) {
-        return { status: 404, body: { error: 'Account not found.' } };
+    try {
+      if (pgStore) {
+        const pgOutcome = await pgStore.exploreLabStep(req.auth!.userId, req.body || {});
+        return res.status(pgOutcome.status).json(pgOutcome.body);
       }
 
-      const result = processLabExplorationStep(account, req.body || {}, ACADEMY_CURRICULUM);
-      if (result.ok === false) {
+      const outcome = await withDbLock(dbPath, () => {
+        const currentDb = loadDb(dbPath);
+        const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
+        if (!account) {
+          return { status: 404, body: { error: 'Account not found.' } };
+        }
+
+        const result = processLabExplorationStep(account, req.body || {}, ACADEMY_CURRICULUM);
+        if (result.ok === false) {
+          return {
+            status: result.status,
+            body: {
+              error: result.error,
+              ...(result.missingPrerequisites ? { missingPrerequisites: result.missingPrerequisites } : {}),
+            },
+          };
+        }
+
+        if (result.dbChanged) {
+          saveDb(currentDb, dbPath);
+        }
+
         return {
-          status: result.status,
-          body: {
-            error: result.error,
-            ...(result.missingPrerequisites ? { missingPrerequisites: result.missingPrerequisites } : {}),
-          },
+          status: 200,
+          body: result.data,
         };
-      }
+      });
 
-      if (result.dbChanged) {
-        saveDb(currentDb, dbPath);
-      }
-
-      return {
-        status: 200,
-        body: result.data,
-      };
-    });
-
-    return res.status(outcome.status).json(outcome.body);
+      return res.status(outcome.status).json(outcome.body);
+    } catch (err) {
+      return sendStorageError(res, err);
+    }
   });
 
   // API: Server-Authoritative Active Engagement & Activity Verification
@@ -1404,16 +1676,9 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
       }
     }
 
-    const result = await withDbLock(dbPath, () => {
-      const currentDb = loadDb(dbPath);
-      const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
-      if (!account) {
-        return { status: 404, body: { error: 'Account not found' } };
-      }
-
-      const outcome = applyEngagementMutation(
-        account,
-        {
+    try {
+      if (pgStore) {
+        const pgOutcome = await pgStore.engageUser(req.auth!.userId, {
           engagementType,
           lessonId: lessonId.trim(),
           exerciseId: typeof exerciseId === 'string' ? exerciseId.trim() : undefined,
@@ -1422,81 +1687,114 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
           terminalOutput,
           xpEarned,
           xp,
-        },
-        ACADEMY_CURRICULUM
-      );
+        });
+        return res.status(pgOutcome.status).json(pgOutcome.body);
+      }
 
-      if (outcome.ok === false) {
+      const result = await withDbLock(dbPath, () => {
+        const currentDb = loadDb(dbPath);
+        const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
+        if (!account) {
+          return { status: 404, body: { error: 'Account not found' } };
+        }
+
+        const outcome = applyEngagementMutation(
+          account,
+          {
+            engagementType,
+            lessonId: lessonId.trim(),
+            exerciseId: typeof exerciseId === 'string' ? exerciseId.trim() : undefined,
+            selectedOption,
+            answers,
+            terminalOutput,
+            xpEarned,
+            xp,
+          },
+          ACADEMY_CURRICULUM
+        );
+
+        if (outcome.ok === false) {
+          return {
+            status: outcome.status,
+            body: {
+              error: outcome.error,
+              ...(outcome.missingPrerequisites
+                ? { missingPrerequisites: outcome.missingPrerequisites }
+                : {}),
+              ...(outcome.scorePercent !== undefined ? { scorePercent: outcome.scorePercent } : {}),
+              ...(outcome.requiredPercent !== undefined
+                ? { requiredPercent: outcome.requiredPercent }
+                : {}),
+              ...(outcome.correctCount !== undefined ? { correctCount: outcome.correctCount } : {}),
+              ...(outcome.totalQuestions !== undefined
+                ? { totalQuestions: outcome.totalQuestions }
+                : {}),
+              ...(outcome.passed !== undefined ? { passed: outcome.passed } : {}),
+              ...(outcome.questionFeedback ? { questionFeedback: outcome.questionFeedback } : {}),
+              ...(outcome.misconceptionHints ? { misconceptionHints: outcome.misconceptionHints } : {}),
+              ...(outcome.recommendedSections ? { recommendedSections: outcome.recommendedSections } : {}),
+              ...(outcome.misconceptionFeedback
+                ? { misconceptionFeedback: outcome.misconceptionFeedback }
+                : {}),
+              ...(outcome.selectedReasoningStatus
+                ? { selectedReasoningStatus: outcome.selectedReasoningStatus }
+                : {}),
+              ...(outcome.hint ? { hint: outcome.hint } : {}),
+              ...(outcome.reviewSection ? { reviewSection: outcome.reviewSection } : {}),
+            },
+          };
+        }
+
+        if (outcome.xpAwarded > 0 && outcome.timelineAction) {
+          const newEvent: TimelineEvent = {
+            id: `ev-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            username: account.user.username,
+            action: outcome.timelineAction,
+            xpReward: outcome.xpAwarded,
+            timestamp: new Date().toISOString(),
+          };
+          currentDb.timelineEvents.unshift(newEvent);
+        }
+
+        saveDb(currentDb, dbPath);
         return {
-          status: outcome.status,
+          status: 200,
           body: {
-            error: outcome.error,
-            ...(outcome.missingPrerequisites
-              ? { missingPrerequisites: outcome.missingPrerequisites }
-              : {}),
-            ...(outcome.scorePercent !== undefined ? { scorePercent: outcome.scorePercent } : {}),
-            ...(outcome.requiredPercent !== undefined
-              ? { requiredPercent: outcome.requiredPercent }
-              : {}),
-            ...(outcome.correctCount !== undefined ? { correctCount: outcome.correctCount } : {}),
-            ...(outcome.totalQuestions !== undefined
-              ? { totalQuestions: outcome.totalQuestions }
-              : {}),
-            ...(outcome.passed !== undefined ? { passed: outcome.passed } : {}),
+            user: sanitizeSelfUser(account.user),
+            progress: account.progress,
+            xpAwarded: outcome.xpAwarded,
+            newlyCompletedLesson: outcome.newlyCompletedLesson,
+            scorePercent: outcome.scorePercent,
+            requiredPercent: outcome.requiredPercent,
+            correctCount: outcome.correctCount,
+            totalQuestions: outcome.totalQuestions,
+            passed: outcome.passed,
             ...(outcome.questionFeedback ? { questionFeedback: outcome.questionFeedback } : {}),
-            ...(outcome.misconceptionHints ? { misconceptionHints: outcome.misconceptionHints } : {}),
-            ...(outcome.recommendedSections ? { recommendedSections: outcome.recommendedSections } : {}),
-            ...(outcome.misconceptionFeedback
-              ? { misconceptionFeedback: outcome.misconceptionFeedback }
-              : {}),
-            ...(outcome.selectedReasoningStatus
-              ? { selectedReasoningStatus: outcome.selectedReasoningStatus }
-              : {}),
-            ...(outcome.hint ? { hint: outcome.hint } : {}),
-            ...(outcome.reviewSection ? { reviewSection: outcome.reviewSection } : {}),
+            ...(outcome.explanation ? { explanation: outcome.explanation } : {}),
           },
         };
-      }
+      });
 
-      if (outcome.xpAwarded > 0 && outcome.timelineAction) {
-        const newEvent: TimelineEvent = {
-          id: `ev-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-          username: account.user.username,
-          action: outcome.timelineAction,
-          xpReward: outcome.xpAwarded,
-          timestamp: new Date().toISOString(),
-        };
-        currentDb.timelineEvents.unshift(newEvent);
-      }
-
-      saveDb(currentDb, dbPath);
-      return {
-        status: 200,
-        body: {
-          user: sanitizeSelfUser(account.user),
-          progress: account.progress,
-          xpAwarded: outcome.xpAwarded,
-          newlyCompletedLesson: outcome.newlyCompletedLesson,
-          scorePercent: outcome.scorePercent,
-          requiredPercent: outcome.requiredPercent,
-          correctCount: outcome.correctCount,
-          totalQuestions: outcome.totalQuestions,
-          passed: outcome.passed,
-          ...(outcome.questionFeedback ? { questionFeedback: outcome.questionFeedback } : {}),
-          ...(outcome.explanation ? { explanation: outcome.explanation } : {}),
-        },
-      };
-    });
-
-    return res.status(result.status).json(result.body);
+      return res.status(result.status).json(result.body);
+    } catch (err) {
+      return sendStorageError(res, err);
+    }
   });
 
   // API: Get Forum Posts (projects per-viewer userVote when authenticated; strips internal votesByUserId)
-  app.get('/api/posts', (req, res) => {
-    const authCheck = authenticateCookieSession(req);
-    const viewerUserId = authCheck.ok ? authCheck.auth.userId : undefined;
-    const currentDb = loadDb(dbPath);
-    res.json(currentDb.posts.map((p) => sanitizePostForClient(p, viewerUserId)));
+  app.get('/api/posts', async (req, res) => {
+    try {
+      const authCheck = await authenticateCookieSession(req);
+      const viewerUserId = authCheck.ok ? authCheck.auth.userId : undefined;
+      if (pgStore) {
+        const posts = await pgStore.getPosts(viewerUserId);
+        return res.json(posts);
+      }
+      const currentDb = loadDb(dbPath);
+      return res.json(currentDb.posts.map((p) => sanitizePostForClient(p, viewerUserId)));
+    } catch (err) {
+      return sendStorageError(res, err);
+    }
   });
 
   // API: Create Forum Post (throttled + server-derived role + server-verified daily XP cap)
@@ -1529,50 +1827,66 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
     const VALID_CATEGORIES = ['General', 'Help', 'Defensive', 'Offensive', 'Certifications'];
     const safeCategory = VALID_CATEGORIES.includes(category) ? category : 'General';
 
-    const result = await withDbLock(dbPath, () => {
-      const currentDb = loadDb(dbPath);
-      const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
-      if (!account) {
-        return { errorStatus: 404, error: 'User not found.' };
+    try {
+      if (pgStore) {
+        const pgRes = await pgStore.createPost(req.auth!.userId, {
+          title: title.trim(),
+          content: content.trim(),
+          category: safeCategory,
+        });
+        if (pgRes.ok === false) {
+          return res.status(pgRes.status).json({ error: pgRes.error });
+        }
+        return res.status(201).json(pgRes.body);
       }
 
-      const derivedRole = deriveForumRoleFromRank(account.user.rank);
+      const result = await withDbLock(dbPath, () => {
+        const currentDb = loadDb(dbPath);
+        const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
+        if (!account) {
+          return { errorStatus: 404, error: 'User not found.' };
+        }
 
-      const newPost: PersistedCommunityPost = {
-        id: `post-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-        title: title.trim(),
-        author: account.user.username.replace('@', ''),
-        authorRole: derivedRole,
-        content: content.trim(),
-        category: safeCategory,
-        upvotes: 1,
-        userVote: 'up',
-        votesByUserId: { [account.user.id]: 'up' },
-        createdAt: new Date().toISOString(),
-        commentsCount: 0,
-      };
+        const derivedRole = deriveForumRoleFromRank(account.user.rank);
 
-      currentDb.posts.unshift(newPost);
+        const newPost: PersistedCommunityPost = {
+          id: `post-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          title: title.trim(),
+          author: account.user.username.replace('@', ''),
+          authorRole: derivedRole,
+          content: content.trim(),
+          category: safeCategory,
+          upvotes: 1,
+          userVote: 'up',
+          votesByUserId: { [account.user.id]: 'up' },
+          createdAt: new Date().toISOString(),
+          commentsCount: 0,
+        };
 
-      const xpOutcome = applyPostCreationXp(account, newPost.id, newPost.title);
-      if (xpOutcome.timelineEvent) {
-        currentDb.timelineEvents.unshift(xpOutcome.timelineEvent);
+        currentDb.posts.unshift(newPost);
+
+        const xpOutcome = applyPostCreationXp(account, newPost.id, newPost.title);
+        if (xpOutcome.timelineEvent) {
+          currentDb.timelineEvents.unshift(xpOutcome.timelineEvent);
+        }
+
+        saveDb(currentDb, dbPath);
+        return {
+          ...sanitizePostForClient(newPost, account.user.id),
+          xpAwarded: xpOutcome.xpAwarded,
+          dailyPostXpCapReached: xpOutcome.dailyCapReached,
+          user: sanitizeSelfUser(account.user),
+          progress: account.progress,
+        };
+      });
+
+      if ('errorStatus' in result) {
+        return res.status(result.errorStatus).json({ error: result.error });
       }
-
-      saveDb(currentDb, dbPath);
-      return {
-        ...sanitizePostForClient(newPost, account.user.id),
-        xpAwarded: xpOutcome.xpAwarded,
-        dailyPostXpCapReached: xpOutcome.dailyCapReached,
-        user: sanitizeSelfUser(account.user),
-        progress: account.progress,
-      };
-    });
-
-    if ('errorStatus' in result) {
-      return res.status(result.errorStatus).json({ error: result.error });
+      return res.status(201).json(result);
+    } catch (err) {
+      return sendStorageError(res, err);
     }
-    return res.status(201).json(result);
   });
 
   // API: Vote Forum Post (server-authoritative per-user vote ledger, rate-limited, serialized)
@@ -1596,123 +1910,182 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
       });
     }
 
-    const result = await withDbLock(dbPath, () => {
-      const currentDb = loadDb(dbPath);
-      const voterAccount = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
-      if (!voterAccount) {
-        return { errorStatus: 404, error: 'Account not found.' };
-      }
-
-      const post = currentDb.posts.find((p) => p.id === postId);
-      if (!post) {
-        return { errorStatus: 404, error: 'Post not found' };
-      }
-
-      if (!post.votesByUserId || typeof post.votesByUserId !== 'object') {
-        post.votesByUserId = {};
-      }
-
-      const oldVote: 'up' | 'down' | null = post.votesByUserId[voterAccount.user.id] ?? null;
-
-      if (oldVote !== voteType) {
-        let diff = 0;
-        if (oldVote === 'up') diff -= 1;
-        if (oldVote === 'down') diff += 1;
-        if (voteType === 'up') diff += 1;
-        if (voteType === 'down') diff -= 1;
-
-        post.upvotes = post.upvotes + diff;
-        if (voteType === null) {
-          delete post.votesByUserId[voterAccount.user.id];
-        } else {
-          post.votesByUserId[voterAccount.user.id] = voteType;
+    try {
+      if (pgStore) {
+        const pgVote = await pgStore.votePost(req.auth!.userId, postId, voteType);
+        if (pgVote.ok === false) {
+          return res.status(pgVote.status).json({ error: pgVote.error });
         }
-        saveDb(currentDb, dbPath);
+        return res.json(pgVote.post);
       }
 
-      return { post: sanitizePostForClient(post, voterAccount.user.id) };
-    });
+      const result = await withDbLock(dbPath, () => {
+        const currentDb = loadDb(dbPath);
+        const voterAccount = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
+        if (!voterAccount) {
+          return { errorStatus: 404, error: 'Account not found.' };
+        }
 
-    if ('errorStatus' in result) {
-      return res.status(result.errorStatus).json({ error: result.error });
+        const post = currentDb.posts.find((p) => p.id === postId);
+        if (!post) {
+          return { errorStatus: 404, error: 'Post not found' };
+        }
+
+        if (!post.votesByUserId || typeof post.votesByUserId !== 'object') {
+          post.votesByUserId = {};
+        }
+
+        const oldVote: 'up' | 'down' | null = post.votesByUserId[voterAccount.user.id] ?? null;
+
+        if (oldVote !== voteType) {
+          let diff = 0;
+          if (oldVote === 'up') diff -= 1;
+          if (oldVote === 'down') diff += 1;
+          if (voteType === 'up') diff += 1;
+          if (voteType === 'down') diff -= 1;
+
+          post.upvotes = post.upvotes + diff;
+          if (voteType === null) {
+            delete post.votesByUserId[voterAccount.user.id];
+          } else {
+            post.votesByUserId[voterAccount.user.id] = voteType;
+          }
+          saveDb(currentDb, dbPath);
+        }
+
+        return { post: sanitizePostForClient(post, voterAccount.user.id) };
+      });
+
+      if ('errorStatus' in result) {
+        return res.status(result.errorStatus).json({ error: result.error });
+      }
+      return res.json(result.post);
+    } catch (err) {
+      return sendStorageError(res, err);
     }
-    return res.json(result.post);
   });
 
   // API: Get Lab Notes
-  app.get('/api/labnotes', requireAuth, (req: AuthenticatedRequest, res) => {
-    const currentDb = loadDb(dbPath);
-    const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
-    if (!account) {
-      return res.status(404).json({ error: 'Account not found' });
+  app.get('/api/labnotes', requireAuth, async (req: AuthenticatedRequest, res) => {
+    try {
+      if (pgStore) {
+        const pgNotes = await pgStore.getLabNotes(req.auth!.userId);
+        if (pgNotes.ok === false) {
+          return res.status(pgNotes.status).json({ error: pgNotes.error });
+        }
+        return res.json(pgNotes.labNotes);
+      }
+
+      const currentDb = loadDb(dbPath);
+      const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
+      if (!account) {
+        return res.status(404).json({ error: 'Account not found' });
+      }
+      return res.json(account.labNotes || []);
+    } catch (err) {
+      return sendStorageError(res, err);
     }
-    res.json(account.labNotes || []);
   });
 
   // API: Save/Update Lab Note
   app.post('/api/labnotes', requireAuth, async (req: AuthenticatedRequest, res) => {
     const { note } = req.body || {};
-    if (!note || typeof note !== 'object' || typeof note.id !== 'string') {
+    if (!note || typeof note !== 'object' || typeof note.id !== 'string' || !note.id.trim() || note.id.length > 128) {
       return res.status(400).json({ error: 'Missing valid note payload' });
     }
 
-    const result = await withDbLock(dbPath, () => {
-      const currentDb = loadDb(dbPath);
-      const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
-      if (!account) {
-        return { errorStatus: 404, error: 'Account not found' };
+    try {
+      if (pgStore) {
+        const pgSave = await pgStore.saveLabNote(req.auth!.userId, note);
+        if (pgSave.ok === false) {
+          return res.status(pgSave.status).json({ error: pgSave.error });
+        }
+        return res.json(pgSave.labNotes);
       }
 
-      if (!account.labNotes) {
-        account.labNotes = [];
+      const result = await withDbLock(dbPath, () => {
+        const currentDb = loadDb(dbPath);
+        const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
+        if (!account) {
+          return { errorStatus: 404, error: 'Account not found' };
+        }
+
+        if (!account.labNotes) {
+          account.labNotes = [];
+        }
+
+        const index = account.labNotes.findIndex((n) => n.id === note.id);
+        if (index !== -1) {
+          account.labNotes[index] = note;
+        } else {
+          account.labNotes.unshift(note);
+        }
+
+        saveDb(currentDb, dbPath);
+        return { labNotes: account.labNotes };
+      });
+
+      if ('errorStatus' in result) {
+        return res.status(result.errorStatus).json({ error: result.error });
       }
-
-      const index = account.labNotes.findIndex((n) => n.id === note.id);
-      if (index !== -1) {
-        account.labNotes[index] = note;
-      } else {
-        account.labNotes.unshift(note);
-      }
-
-      saveDb(currentDb, dbPath);
-      return { labNotes: account.labNotes };
-    });
-
-    if ('errorStatus' in result) {
-      return res.status(result.errorStatus).json({ error: result.error });
+      return res.json(result.labNotes);
+    } catch (err) {
+      return sendStorageError(res, err);
     }
-    return res.json(result.labNotes);
   });
 
   // API: Delete Lab Note
   app.delete('/api/labnotes/:id', requireAuth, async (req: AuthenticatedRequest, res) => {
     const noteId = req.params.id;
-
-    const result = await withDbLock(dbPath, () => {
-      const currentDb = loadDb(dbPath);
-      const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
-      if (!account) {
-        return { errorStatus: 404, error: 'Account not found' };
-      }
-
-      if (account.labNotes) {
-        account.labNotes = account.labNotes.filter((n) => n.id !== noteId);
-      }
-
-      saveDb(currentDb, dbPath);
-      return { success: true };
-    });
-
-    if ('errorStatus' in result) {
-      return res.status(result.errorStatus).json({ error: result.error });
+    if (typeof noteId !== 'string' || !noteId.trim() || noteId.length > 128) {
+      return res.status(400).json({ error: 'Invalid note identifier.' });
     }
-    return res.json(result);
+
+    try {
+      if (pgStore) {
+        const pgDel = await pgStore.deleteLabNote(req.auth!.userId, noteId);
+        if (pgDel.ok === false) {
+          return res.status(pgDel.status).json({ error: pgDel.error });
+        }
+        return res.json({ success: true });
+      }
+
+      const result = await withDbLock(dbPath, () => {
+        const currentDb = loadDb(dbPath);
+        const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
+        if (!account) {
+          return { errorStatus: 404, error: 'Account not found' };
+        }
+
+        if (account.labNotes) {
+          account.labNotes = account.labNotes.filter((n) => n.id !== noteId);
+        }
+
+        saveDb(currentDb, dbPath);
+        return { success: true };
+      });
+
+      if ('errorStatus' in result) {
+        return res.status(result.errorStatus).json({ error: result.error });
+      }
+      return res.json(result);
+    } catch (err) {
+      return sendStorageError(res, err);
+    }
   });
 
   // API: Get Timeline Events
-  app.get('/api/timeline', (_req, res) => {
-    const currentDb = loadDb(dbPath);
-    res.json(currentDb.timelineEvents);
+  app.get('/api/timeline', async (_req, res) => {
+    try {
+      if (pgStore) {
+        const events = await pgStore.getTimelineEvents();
+        return res.json(events);
+      }
+      const currentDb = loadDb(dbPath);
+      return res.json(currentDb.timelineEvents);
+    } catch (err) {
+      return sendStorageError(res, err);
+    }
   });
 
   // API: Block client-forged timeline XP telemetry (generated server-side on verified activities)
@@ -1723,52 +2096,85 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
   });
 
   // API: Get all groups (authentication required; visibility & membership sanitized; zero internal IDs)
-  app.get('/api/groups', requireAuth, (req: AuthenticatedRequest, res) => {
-    const currentDb = loadDb(dbPath);
-    const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
-    if (!account) {
-      return res.status(404).json({ error: 'Account not found' });
+  app.get('/api/groups', requireAuth, async (req: AuthenticatedRequest, res) => {
+    try {
+      if (pgStore) {
+        const pgGroups = await pgStore.getGroupsForUser(req.auth!.userId);
+        if (pgGroups.ok === false) {
+          return res.status(pgGroups.status).json({ error: pgGroups.error });
+        }
+        return res.json(pgGroups.groups);
+      }
+      const currentDb = loadDb(dbPath);
+      const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
+      if (!account) {
+        return res.status(404).json({ error: 'Account not found' });
+      }
+      const sanitized = (currentDb.groups || []).map((g) => sanitizeGroupForUser(g, account.user));
+      return res.json(sanitized);
+    } catch (err) {
+      return sendStorageError(res, err);
     }
-    const sanitized = (currentDb.groups || []).map((g) => sanitizeGroupForUser(g, account.user));
-    return res.json(sanitized);
   });
 
   // API: Get single group detail (private groups restricted to authorized members)
-  app.get('/api/groups/:id', requireAuth, (req: AuthenticatedRequest, res) => {
-    const currentDb = loadDb(dbPath);
-    const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
-    if (!account) {
-      return res.status(404).json({ error: 'Account not found' });
+  app.get('/api/groups/:id', requireAuth, async (req: AuthenticatedRequest, res) => {
+    try {
+      if (pgStore) {
+        const pgGroup = await pgStore.getGroupDetailForUser(req.auth!.userId, req.params.id);
+        if (pgGroup.ok === false) {
+          return res.status(pgGroup.status).json({ error: pgGroup.error });
+        }
+        return res.json(pgGroup.group);
+      }
+      const currentDb = loadDb(dbPath);
+      const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
+      if (!account) {
+        return res.status(404).json({ error: 'Account not found' });
+      }
+      const group = (currentDb.groups || []).find((g) => g.id === req.params.id);
+      if (!group) {
+        return res.status(404).json({ error: 'Community group not found' });
+      }
+      if (group.visibility !== 'public' && !isGroupMember(group, account.user)) {
+        return res.status(403).json({
+          error: 'Private group details are restricted to authorized members.',
+        });
+      }
+      return res.json(sanitizeGroupForUser(group, account.user));
+    } catch (err) {
+      return sendStorageError(res, err);
     }
-    const group = (currentDb.groups || []).find((g) => g.id === req.params.id);
-    if (!group) {
-      return res.status(404).json({ error: 'Community group not found' });
-    }
-    if (group.visibility !== 'public' && !isGroupMember(group, account.user)) {
-      return res.status(403).json({
-        error: 'Private group details are restricted to authorized members.',
-      });
-    }
-    return res.json(sanitizeGroupForUser(group, account.user));
   });
 
   // API: Get group messages (authorized members only)
-  app.get('/api/groups/:id/messages', requireAuth, (req: AuthenticatedRequest, res) => {
-    const currentDb = loadDb(dbPath);
-    const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
-    if (!account) {
-      return res.status(404).json({ error: 'Account not found' });
+  app.get('/api/groups/:id/messages', requireAuth, async (req: AuthenticatedRequest, res) => {
+    try {
+      if (pgStore) {
+        const pgMsgs = await pgStore.getGroupMessagesForUser(req.auth!.userId, req.params.id);
+        if (pgMsgs.ok === false) {
+          return res.status(pgMsgs.status).json({ error: pgMsgs.error });
+        }
+        return res.json(pgMsgs.messages);
+      }
+      const currentDb = loadDb(dbPath);
+      const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
+      if (!account) {
+        return res.status(404).json({ error: 'Account not found' });
+      }
+      const group = (currentDb.groups || []).find((g) => g.id === req.params.id);
+      if (!group) {
+        return res.status(404).json({ error: 'Community group not found' });
+      }
+      if (!isGroupMember(group, account.user)) {
+        return res.status(403).json({
+          error: 'Membership is required to retrieve group messages.',
+        });
+      }
+      return res.json((group.messages || []).map(sanitizeGroupMessage));
+    } catch (err) {
+      return sendStorageError(res, err);
     }
-    const group = (currentDb.groups || []).find((g) => g.id === req.params.id);
-    if (!group) {
-      return res.status(404).json({ error: 'Community group not found' });
-    }
-    if (!isGroupMember(group, account.user)) {
-      return res.status(403).json({
-        error: 'Membership is required to retrieve group messages.',
-      });
-    }
-    return res.json((group.messages || []).map(sanitizeGroupMessage));
   });
 
   // API: Create a new group (rate-limited, length-validated, conservative private default, sanitized response)
@@ -1813,82 +2219,114 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
       });
     }
 
-    const result = await withDbLock(dbPath, () => {
-      const currentDb = loadDb(dbPath);
-      const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
-      if (!account) {
-        return { errorStatus: 404, error: 'Account not found' };
+    const safeAvatar =
+      typeof avatar === 'string' && avatar.trim() ? avatar.trim().slice(0, 8) : '👥';
+
+    try {
+      if (pgStore) {
+        const pgCreate = await pgStore.createGroup(req.auth!.userId, {
+          name: cleanName,
+          description: cleanDescription,
+          avatar: safeAvatar,
+          visibility: safeVisibility,
+        });
+        if (pgCreate.ok === false) {
+          return res.status(pgCreate.status).json({ error: pgCreate.error });
+        }
+        return res.status(201).json(pgCreate.group);
       }
 
-      const newGroup: Group = {
-        id: `grp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-        name: cleanName,
-        description: cleanDescription,
-        avatar: typeof avatar === 'string' && avatar.trim() ? avatar.trim().slice(0, 8) : '👥',
-        visibility: safeVisibility,
-        ownerId: account.user.id,
-        ownerHandle: account.user.username,
-        members: [account.user.username],
-        invitations: [],
-        joinRequests: [],
-        messages: [],
-        createdAt: new Date().toISOString(),
-      };
+      const result = await withDbLock(dbPath, () => {
+        const currentDb = loadDb(dbPath);
+        const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
+        if (!account) {
+          return { errorStatus: 404, error: 'Account not found' };
+        }
 
-      if (!currentDb.groups) {
-        currentDb.groups = [];
+        const newGroup: Group = {
+          id: `grp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          name: cleanName,
+          description: cleanDescription,
+          avatar: safeAvatar,
+          visibility: safeVisibility,
+          ownerId: account.user.id,
+          ownerHandle: account.user.username,
+          members: [account.user.username],
+          invitations: [],
+          joinRequests: [],
+          messages: [],
+          createdAt: new Date().toISOString(),
+        };
+
+        if (!currentDb.groups) {
+          currentDb.groups = [];
+        }
+
+        currentDb.groups.push(newGroup);
+        saveDb(currentDb, dbPath);
+        return { group: sanitizeGroupForUser(newGroup, account.user) };
+      });
+
+      if ('errorStatus' in result) {
+        return res.status(result.errorStatus).json({ error: result.error });
       }
-
-      currentDb.groups.push(newGroup);
-      saveDb(currentDb, dbPath);
-      return { group: sanitizeGroupForUser(newGroup, account.user) };
-    });
-
-    if ('errorStatus' in result) {
-      return res.status(result.errorStatus).json({ error: result.error });
+      return res.status(201).json(result.group);
+    } catch (err) {
+      return sendStorageError(res, err);
     }
-    return res.status(201).json(result.group);
   });
 
   // API: Join a PUBLIC group directly (private groups strictly forbid self-joining)
   app.post('/api/groups/:id/join', requireAuth, async (req: AuthenticatedRequest, res) => {
     const groupId = req.params.id;
-    const result = await withDbLock(dbPath, () => {
-      const currentDb = loadDb(dbPath);
-      const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
-      if (!account) {
-        return { errorStatus: 404, error: 'Account not found' };
-      }
-      const group = (currentDb.groups || []).find((g) => g.id === groupId);
-      if (!group) {
-        return { errorStatus: 404, error: 'Community group not found' };
-      }
-      if (isGroupMember(group, account.user)) {
-        return { errorStatus: 409, error: 'You are already a member of this group.' };
-      }
-      if (group.visibility !== 'public') {
-        return {
-          errorStatus: 403,
-          error: 'Private groups cannot be self-joined. Request access or accept an owner invitation.',
-        };
+    try {
+      if (pgStore) {
+        const pgJoin = await pgStore.joinPublicGroup(req.auth!.userId, groupId);
+        if (pgJoin.ok === false) {
+          return res.status(pgJoin.status).json({ error: pgJoin.error });
+        }
+        return res.json(pgJoin.group);
       }
 
-      addMemberDeduplicated(group, account.user.username);
-      const selfNorm = normalizeHandle(account.user.username);
-      group.invitations = pruneExpiredInvitations(group.invitations).filter(
-        (inv) => normalizeHandle(inv.username) !== selfNorm
-      );
-      group.joinRequests = (group.joinRequests || []).filter(
-        (r) => normalizeHandle(r.username) !== selfNorm
-      );
-      saveDb(currentDb, dbPath);
-      return { group: sanitizeGroupForUser(group, account.user) };
-    });
+      const result = await withDbLock(dbPath, () => {
+        const currentDb = loadDb(dbPath);
+        const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
+        if (!account) {
+          return { errorStatus: 404, error: 'Account not found' };
+        }
+        const group = (currentDb.groups || []).find((g) => g.id === groupId);
+        if (!group) {
+          return { errorStatus: 404, error: 'Community group not found' };
+        }
+        if (isGroupMember(group, account.user)) {
+          return { errorStatus: 409, error: 'You are already a member of this group.' };
+        }
+        if (group.visibility !== 'public') {
+          return {
+            errorStatus: 403,
+            error: 'Private groups cannot be self-joined. Request access or accept an owner invitation.',
+          };
+        }
 
-    if ('errorStatus' in result) {
-      return res.status(result.errorStatus).json({ error: result.error });
+        addMemberDeduplicated(group, account.user.username);
+        const selfNorm = normalizeHandle(account.user.username);
+        group.invitations = pruneExpiredInvitations(group.invitations).filter(
+          (inv) => normalizeHandle(inv.username) !== selfNorm
+        );
+        group.joinRequests = (group.joinRequests || []).filter(
+          (r) => normalizeHandle(r.username) !== selfNorm
+        );
+        saveDb(currentDb, dbPath);
+        return { group: sanitizeGroupForUser(group, account.user) };
+      });
+
+      if ('errorStatus' in result) {
+        return res.status(result.errorStatus).json({ error: result.error });
+      }
+      return res.json(result.group);
+    } catch (err) {
+      return sendStorageError(res, err);
     }
-    return res.json(result.group);
   });
 
   // API: Owner-only group invitation creation
@@ -1900,41 +2338,56 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
       return res.status(400).json({ error: 'Valid invitee handle is required.' });
     }
 
-    const result = await withDbLock(dbPath, () => {
-      const currentDb = loadDb(dbPath);
-      const requester = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
-      if (!requester) {
-        return { errorStatus: 404, error: 'Account not found' };
-      }
-      const group = (currentDb.groups || []).find((g) => g.id === groupId);
-      if (!group) {
-        return { errorStatus: 404, error: 'Community group not found' };
-      }
-      if (!isGroupOwner(group, requester.user)) {
-        return { errorStatus: 403, error: 'Only the group owner can issue invitations.' };
+    try {
+      if (pgStore) {
+        const pgInv = await pgStore.createGroupInvitation(req.auth!.userId, groupId, username);
+        if (pgInv.ok === false) {
+          return res.status(pgInv.status).json({ error: pgInv.error });
+        }
+        return res.status(201).json({
+          invitation: pgInv.invitation,
+          group: pgInv.group,
+        });
       }
 
-      const targetAcc = findAccountByHandle(currentDb.accounts, username);
-      if (!targetAcc) {
-        return { errorStatus: 404, error: 'Target operator handle was not found.' };
+      const result = await withDbLock(dbPath, () => {
+        const currentDb = loadDb(dbPath);
+        const requester = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
+        if (!requester) {
+          return { errorStatus: 404, error: 'Account not found' };
+        }
+        const group = (currentDb.groups || []).find((g) => g.id === groupId);
+        if (!group) {
+          return { errorStatus: 404, error: 'Community group not found' };
+        }
+        if (!isGroupOwner(group, requester.user)) {
+          return { errorStatus: 403, error: 'Only the group owner can issue invitations.' };
+        }
+
+        const targetAcc = findAccountByHandle(currentDb.accounts, username);
+        if (!targetAcc) {
+          return { errorStatus: 404, error: 'Target operator handle was not found.' };
+        }
+
+        const created = createGroupInvitationRecord(group, requester.user, targetAcc);
+        if (created.ok === false) {
+          return { errorStatus: created.status, error: created.error };
+        }
+
+        saveDb(currentDb, dbPath);
+        return {
+          invitation: created.invitation,
+          group: sanitizeGroupForUser(group, requester.user),
+        };
+      });
+
+      if ('errorStatus' in result) {
+        return res.status(result.errorStatus).json({ error: result.error });
       }
-
-      const created = createGroupInvitationRecord(group, requester.user, targetAcc);
-      if (created.ok === false) {
-        return { errorStatus: created.status, error: created.error };
-      }
-
-      saveDb(currentDb, dbPath);
-      return {
-        invitation: created.invitation,
-        group: sanitizeGroupForUser(group, requester.user),
-      };
-    });
-
-    if ('errorStatus' in result) {
-      return res.status(result.errorStatus).json({ error: result.error });
+      return res.status(201).json(result);
+    } catch (err) {
+      return sendStorageError(res, err);
     }
-    return res.status(201).json(result);
   });
 
   // API: Invited user responds (accept / decline) to an active invitation
@@ -1946,87 +2399,114 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
       return res.status(400).json({ error: 'Invitation action must be "accept" or "decline".' });
     }
 
-    const result = await withDbLock(dbPath, () => {
-      const currentDb = loadDb(dbPath);
-      const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
-      if (!account) {
-        return { errorStatus: 404, error: 'Account not found' };
-      }
-      const group = (currentDb.groups || []).find((g) => g.id === groupId);
-      if (!group) {
-        return { errorStatus: 404, error: 'Community group not found' };
-      }
-
-      const selfNorm = normalizeHandle(account.user.username);
-      const existingInv = (group.invitations || []).find(
-        (inv) => normalizeHandle(inv.username) === selfNorm
-      );
-
-      if (!existingInv) {
-        return { errorStatus: 403, error: 'You do not have an invitation for this group.' };
+    try {
+      if (pgStore) {
+        const pgResp = await pgStore.respondGroupInvitation(req.auth!.userId, groupId, action);
+        if (pgResp.ok === false) {
+          return res.status(pgResp.status).json({ error: pgResp.error });
+        }
+        return res.json({
+          accepted: pgResp.accepted,
+          group: pgResp.group,
+        });
       }
 
-      const expMs = Date.parse(existingInv.expiresAt);
-      const isExpired = !Number.isFinite(expMs) || expMs <= Date.now();
-      group.invitations = pruneExpiredInvitations(group.invitations).filter(
-        (inv) => normalizeHandle(inv.username) !== selfNorm
-      );
+      const result = await withDbLock(dbPath, () => {
+        const currentDb = loadDb(dbPath);
+        const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
+        if (!account) {
+          return { errorStatus: 404, error: 'Account not found' };
+        }
+        const group = (currentDb.groups || []).find((g) => g.id === groupId);
+        if (!group) {
+          return { errorStatus: 404, error: 'Community group not found' };
+        }
 
-      if (isExpired) {
+        const selfNorm = normalizeHandle(account.user.username);
+        const existingInv = (group.invitations || []).find(
+          (inv) => normalizeHandle(inv.username) === selfNorm
+        );
+
+        if (!existingInv) {
+          return { errorStatus: 403, error: 'You do not have an invitation for this group.' };
+        }
+
+        const expMs = Date.parse(existingInv.expiresAt);
+        const isExpired = !Number.isFinite(expMs) || expMs <= Date.now();
+        group.invitations = pruneExpiredInvitations(group.invitations).filter(
+          (inv) => normalizeHandle(inv.username) !== selfNorm
+        );
+
+        if (isExpired) {
+          saveDb(currentDb, dbPath);
+          return {
+            errorStatus: 410,
+            error: 'This invitation has expired. Ask the group owner for a new invitation.',
+          };
+        }
+
+        if (action === 'accept') {
+          addMemberDeduplicated(group, account.user.username);
+          group.joinRequests = (group.joinRequests || []).filter(
+            (r) => normalizeHandle(r.username) !== selfNorm
+          );
+        }
+
         saveDb(currentDb, dbPath);
         return {
-          errorStatus: 410,
-          error: 'This invitation has expired. Ask the group owner for a new invitation.',
+          accepted: action === 'accept',
+          group: sanitizeGroupForUser(group, account.user),
         };
+      });
+
+      if ('errorStatus' in result) {
+        return res.status(result.errorStatus).json({ error: result.error });
       }
-
-      if (action === 'accept') {
-        addMemberDeduplicated(group, account.user.username);
-        group.joinRequests = (group.joinRequests || []).filter(
-          (r) => normalizeHandle(r.username) !== selfNorm
-        );
-      }
-
-      saveDb(currentDb, dbPath);
-      return {
-        accepted: action === 'accept',
-        group: sanitizeGroupForUser(group, account.user),
-      };
-    });
-
-    if ('errorStatus' in result) {
-      return res.status(result.errorStatus).json({ error: result.error });
+      return res.json(result);
+    } catch (err) {
+      return sendStorageError(res, err);
     }
-    return res.json(result);
   });
 
   // API: Request access to a private group (requires owner approval)
   app.post('/api/groups/:id/requests', requireAuth, async (req: AuthenticatedRequest, res) => {
     const groupId = req.params.id;
-    const result = await withDbLock(dbPath, () => {
-      const currentDb = loadDb(dbPath);
-      const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
-      if (!account) {
-        return { errorStatus: 404, error: 'Account not found' };
-      }
-      const group = (currentDb.groups || []).find((g) => g.id === groupId);
-      if (!group) {
-        return { errorStatus: 404, error: 'Community group not found' };
+    try {
+      if (pgStore) {
+        const pgReq = await pgStore.createGroupJoinRequest(req.auth!.userId, groupId);
+        if (pgReq.ok === false) {
+          return res.status(pgReq.status).json({ error: pgReq.error });
+        }
+        return res.status(201).json(pgReq.group);
       }
 
-      const created = createJoinRequestRecord(group, account.user);
-      if (created.ok === false) {
-        return { errorStatus: created.status, error: created.error };
+      const result = await withDbLock(dbPath, () => {
+        const currentDb = loadDb(dbPath);
+        const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
+        if (!account) {
+          return { errorStatus: 404, error: 'Account not found' };
+        }
+        const group = (currentDb.groups || []).find((g) => g.id === groupId);
+        if (!group) {
+          return { errorStatus: 404, error: 'Community group not found' };
+        }
+
+        const created = createJoinRequestRecord(group, account.user);
+        if (created.ok === false) {
+          return { errorStatus: created.status, error: created.error };
+        }
+
+        saveDb(currentDb, dbPath);
+        return { group: sanitizeGroupForUser(group, account.user) };
+      });
+
+      if ('errorStatus' in result) {
+        return res.status(result.errorStatus).json({ error: result.error });
       }
-
-      saveDb(currentDb, dbPath);
-      return { group: sanitizeGroupForUser(group, account.user) };
-    });
-
-    if ('errorStatus' in result) {
-      return res.status(result.errorStatus).json({ error: result.error });
+      return res.status(201).json(result.group);
+    } catch (err) {
+      return sendStorageError(res, err);
     }
-    return res.status(201).json(result.group);
   });
 
   // API: Group owner approves or rejects a pending join request
@@ -2041,52 +2521,69 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
       return res.status(400).json({ error: 'Request action must be "approve" or "reject".' });
     }
 
-    const result = await withDbLock(dbPath, () => {
-      const currentDb = loadDb(dbPath);
-      const ownerAccount = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
-      if (!ownerAccount) {
-        return { errorStatus: 404, error: 'Account not found' };
-      }
-      const group = (currentDb.groups || []).find((g) => g.id === groupId);
-      if (!group) {
-        return { errorStatus: 404, error: 'Community group not found' };
-      }
-      if (!isGroupOwner(group, ownerAccount.user)) {
-        return { errorStatus: 403, error: 'Only the group owner can approve or reject join requests.' };
-      }
-
-      const targetNorm = normalizeHandle(username);
-      const pending = (group.joinRequests || []).find(
-        (r) => normalizeHandle(r.username) === targetNorm
-      );
-      if (!pending) {
-        return { errorStatus: 404, error: 'No matching pending join request was found.' };
-      }
-
-      group.joinRequests = (group.joinRequests || []).filter(
-        (r) => normalizeHandle(r.username) !== targetNorm
-      );
-
-      if (action === 'approve') {
-        const targetAcc = findAccountByHandle(currentDb.accounts, username);
-        if (!targetAcc) {
-          saveDb(currentDb, dbPath);
-          return { errorStatus: 404, error: 'Requesting account no longer exists.' };
-        }
-        addMemberDeduplicated(group, targetAcc.user.username);
-        group.invitations = pruneExpiredInvitations(group.invitations).filter(
-          (inv) => normalizeHandle(inv.username) !== targetNorm
+    try {
+      if (pgStore) {
+        const pgResp = await pgStore.respondGroupJoinRequest(
+          req.auth!.userId,
+          groupId,
+          username,
+          action
         );
+        if (pgResp.ok === false) {
+          return res.status(pgResp.status).json({ error: pgResp.error });
+        }
+        return res.json(pgResp.group);
       }
 
-      saveDb(currentDb, dbPath);
-      return { group: sanitizeGroupForUser(group, ownerAccount.user) };
-    });
+      const result = await withDbLock(dbPath, () => {
+        const currentDb = loadDb(dbPath);
+        const ownerAccount = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
+        if (!ownerAccount) {
+          return { errorStatus: 404, error: 'Account not found' };
+        }
+        const group = (currentDb.groups || []).find((g) => g.id === groupId);
+        if (!group) {
+          return { errorStatus: 404, error: 'Community group not found' };
+        }
+        if (!isGroupOwner(group, ownerAccount.user)) {
+          return { errorStatus: 403, error: 'Only the group owner can approve or reject join requests.' };
+        }
 
-    if ('errorStatus' in result) {
-      return res.status(result.errorStatus).json({ error: result.error });
+        const targetNorm = normalizeHandle(username);
+        const pending = (group.joinRequests || []).find(
+          (r) => normalizeHandle(r.username) === targetNorm
+        );
+        if (!pending) {
+          return { errorStatus: 404, error: 'No matching pending join request was found.' };
+        }
+
+        group.joinRequests = (group.joinRequests || []).filter(
+          (r) => normalizeHandle(r.username) !== targetNorm
+        );
+
+        if (action === 'approve') {
+          const targetAcc = findAccountByHandle(currentDb.accounts, username);
+          if (!targetAcc) {
+            saveDb(currentDb, dbPath);
+            return { errorStatus: 404, error: 'Requesting account no longer exists.' };
+          }
+          addMemberDeduplicated(group, targetAcc.user.username);
+          group.invitations = pruneExpiredInvitations(group.invitations).filter(
+            (inv) => normalizeHandle(inv.username) !== targetNorm
+          );
+        }
+
+        saveDb(currentDb, dbPath);
+        return { group: sanitizeGroupForUser(group, ownerAccount.user) };
+      });
+
+      if ('errorStatus' in result) {
+        return res.status(result.errorStatus).json({ error: result.error });
+      }
+      return res.json(result.group);
+    } catch (err) {
+      return sendStorageError(res, err);
     }
-    return res.json(result.group);
   });
 
   // API: Hardened membership endpoint (blocks private self-join & non-owner invitations)
@@ -2098,84 +2595,93 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
       return res.status(400).json({ error: 'Username of the contact is required.' });
     }
 
-    const result = await withDbLock(dbPath, () => {
-      const currentDb = loadDb(dbPath);
-      const requester = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
-      if (!requester) {
-        return { errorStatus: 404, error: 'Account not found' };
+    try {
+      if (pgStore) {
+        const pgMember = await pgStore.manageGroupMember(req.auth!.userId, groupId, username);
+        return res.status(pgMember.status).json(pgMember.body);
       }
 
-      const group = (currentDb.groups || []).find((g) => g.id === groupId);
-      if (!group) {
-        return { errorStatus: 404, error: 'Community group not found' };
-      }
+      const result = await withDbLock(dbPath, () => {
+        const currentDb = loadDb(dbPath);
+        const requester = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
+        if (!requester) {
+          return { errorStatus: 404, error: 'Account not found' };
+        }
 
-      const targetNorm = normalizeHandle(username);
-      const isSelf = targetNorm === normalizeHandle(requester.user.username);
-      const owner = isGroupOwner(group, requester.user);
+        const group = (currentDb.groups || []).find((g) => g.id === groupId);
+        if (!group) {
+          return { errorStatus: 404, error: 'Community group not found' };
+        }
 
-      // Public self-join is allowed; private self-join is strictly forbidden
-      if (isSelf) {
-        if (group.visibility !== 'public') {
+        const targetNorm = normalizeHandle(username);
+        const isSelf = targetNorm === normalizeHandle(requester.user.username);
+        const owner = isGroupOwner(group, requester.user);
+
+        // Public self-join is allowed; private self-join is strictly forbidden
+        if (isSelf) {
+          if (group.visibility !== 'public') {
+            return {
+              errorStatus: 403,
+              error: 'Private groups cannot be self-joined. Request access or accept an owner invitation.',
+            };
+          }
+          if (isGroupMember(group, requester.user)) {
+            return { errorStatus: 409, error: 'You are already a member of this group.' };
+          }
+          addMemberDeduplicated(group, requester.user.username);
+          saveDb(currentDb, dbPath);
+          return { status: 200, body: sanitizeGroupForUser(group, requester.user) };
+        }
+
+        // Adding/inviting another user strictly requires owner authorization
+        if (!owner) {
           return {
             errorStatus: 403,
-            error: 'Private groups cannot be self-joined. Request access or accept an owner invitation.',
+            error: 'Only the group owner can invite or add other members.',
           };
         }
-        if (isGroupMember(group, requester.user)) {
-          return { errorStatus: 409, error: 'You are already a member of this group.' };
+
+        const targetUserAccount = findAccountByHandle(currentDb.accounts, username);
+        if (!targetUserAccount) {
+          return {
+            errorStatus: 404,
+            error: 'Target operator handle was not found.',
+          };
         }
-        addMemberDeduplicated(group, requester.user.username);
-        saveDb(currentDb, dbPath);
-        return { status: 200, body: sanitizeGroupForUser(group, requester.user) };
-      }
 
-      // Adding/inviting another user strictly requires owner authorization
-      if (!owner) {
-        return {
-          errorStatus: 403,
-          error: 'Only the group owner can invite or add other members.',
-        };
-      }
-
-      const targetUserAccount = findAccountByHandle(currentDb.accounts, username);
-      if (!targetUserAccount) {
-        return {
-          errorStatus: 404,
-          error: 'Target operator handle was not found.',
-        };
-      }
-
-      // If the user has an active join request on a private group, owner action approves it
-      const hasPendingReq = (group.joinRequests || []).some(
-        (r) => normalizeHandle(r.username) === targetNorm
-      );
-      if (hasPendingReq) {
-        group.joinRequests = (group.joinRequests || []).filter(
-          (r) => normalizeHandle(r.username) !== targetNorm
+        // If the user has an active join request on a private group, owner action approves it
+        const hasPendingReq = (group.joinRequests || []).some(
+          (r) => normalizeHandle(r.username) === targetNorm
         );
-        addMemberDeduplicated(group, targetUserAccount.user.username);
-        group.invitations = pruneExpiredInvitations(group.invitations).filter(
-          (inv) => normalizeHandle(inv.username) !== targetNorm
-        );
+        if (hasPendingReq) {
+          group.joinRequests = (group.joinRequests || []).filter(
+            (r) => normalizeHandle(r.username) !== targetNorm
+          );
+          addMemberDeduplicated(group, targetUserAccount.user.username);
+          group.invitations = pruneExpiredInvitations(group.invitations).filter(
+            (inv) => normalizeHandle(inv.username) !== targetNorm
+          );
+          saveDb(currentDb, dbPath);
+          return { status: 200, body: sanitizeGroupForUser(group, requester.user) };
+        }
+
+        // Otherwise issue an authorized invitation (requires invitee acceptance)
+        const created = createGroupInvitationRecord(group, requester.user, targetUserAccount);
+        if (created.ok === false) {
+          return { errorStatus: created.status, error: created.error };
+        }
+
         saveDb(currentDb, dbPath);
-        return { status: 200, body: sanitizeGroupForUser(group, requester.user) };
+        return { status: 201, body: sanitizeGroupForUser(group, requester.user) };
+      });
+
+      if ('errorStatus' in result) {
+        return res.status(result.errorStatus).json({ error: result.error });
       }
-
-      // Otherwise issue an authorized invitation (requires invitee acceptance)
-      const created = createGroupInvitationRecord(group, requester.user, targetUserAccount);
-      if (created.ok === false) {
-        return { errorStatus: created.status, error: created.error };
-      }
-
-      saveDb(currentDb, dbPath);
-      return { status: 201, body: sanitizeGroupForUser(group, requester.user) };
-    });
-
-    if ('errorStatus' in result) {
-      return res.status(result.errorStatus).json({ error: result.error });
+      return res.status(result.status).json(result.body);
+    } catch (err) {
+      return sendStorageError(res, err);
     }
-    return res.status(result.status).json(result.body);
   });
 
   // API: Send a message to a group chat (authorized members only, length-validated, rate-limited, sanitized)
@@ -2203,43 +2709,55 @@ export function createApiApp(dbPath = DEFAULT_DB_PATH, options?: CreateApiAppOpt
       });
     }
 
-    const result = await withDbLock(dbPath, () => {
-      const currentDb = loadDb(dbPath);
-      const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
-      if (!account) {
-        return { errorStatus: 404, error: 'Account not found' };
+    try {
+      if (pgStore) {
+        const pgMsg = await pgStore.sendGroupMessage(req.auth!.userId, groupId, cleanContent);
+        if (pgMsg.ok === false) {
+          return res.status(pgMsg.status).json({ error: pgMsg.error });
+        }
+        return res.status(201).json(pgMsg.message);
       }
 
-      const group = (currentDb.groups || []).find((g) => g.id === groupId);
-      if (!group) {
-        return { errorStatus: 404, error: 'Group not found.' };
-      }
+      const result = await withDbLock(dbPath, () => {
+        const currentDb = loadDb(dbPath);
+        const account = currentDb.accounts.find((acc) => acc.user.id === req.auth!.userId);
+        if (!account) {
+          return { errorStatus: 404, error: 'Account not found' };
+        }
 
-      if (!isGroupMember(group, account.user)) {
-        return {
-          errorStatus: 403,
-          error: 'Membership is required to send messages in this group.',
+        const group = (currentDb.groups || []).find((g) => g.id === groupId);
+        if (!group) {
+          return { errorStatus: 404, error: 'Group not found.' };
+        }
+
+        if (!isGroupMember(group, account.user)) {
+          return {
+            errorStatus: 403,
+            error: 'Membership is required to send messages in this group.',
+          };
+        }
+
+        const newMessage: GroupMessage = {
+          id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          senderId: account.user.id,
+          senderUsername: account.user.username,
+          senderRole: account.user.rank.split(' ')[0] || 'Cadet',
+          content: cleanContent,
+          createdAt: new Date().toISOString(),
         };
+
+        group.messages.push(newMessage);
+        saveDb(currentDb, dbPath);
+        return { message: sanitizeGroupMessage(newMessage) };
+      });
+
+      if ('errorStatus' in result) {
+        return res.status(result.errorStatus).json({ error: result.error });
       }
-
-      const newMessage: GroupMessage = {
-        id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-        senderId: account.user.id,
-        senderUsername: account.user.username,
-        senderRole: account.user.rank.split(' ')[0] || 'Cadet',
-        content: cleanContent,
-        createdAt: new Date().toISOString(),
-      };
-
-      group.messages.push(newMessage);
-      saveDb(currentDb, dbPath);
-      return { message: sanitizeGroupMessage(newMessage) };
-    });
-
-    if ('errorStatus' in result) {
-      return res.status(result.errorStatus).json({ error: result.error });
+      return res.status(201).json(result.message);
+    } catch (err) {
+      return sendStorageError(res, err);
     }
-    return res.status(201).json(result.message);
   });
 
   // ==========================================
@@ -2430,7 +2948,7 @@ export async function attachFrontendMiddleware(app: express.Express) {
         isBlockedAppPath(req.originalUrl, 'prod') ||
         reqPath === '/assets' ||
         reqPath.startsWith('/assets/') ||
-        /\.(?:cjs|mjs|js|ts|tsx|map|json|css|env|md|sh|lock|ya?ml|txt|xml|ico|png|svg|jpe?g|webp|woff2?)$/i.test(
+        /\.(?:cjs|mjs|js|ts|tsx|map|json|sql|css|env|md|sh|lock|ya?ml|txt|xml|ico|png|svg|jpe?g|webp|woff2?)$/i.test(
           reqPath
         )
       ) {
@@ -2462,10 +2980,35 @@ async function startServer() {
       `[server] Container PORT matched NGINX_PORT (${process.env.NGINX_PORT}); binding application server safely to port ${port} instead.`
     );
   }
-  const activeDbPath = process.env.CFA_DB_PATH
-    ? path.resolve(process.env.CFA_DB_PATH)
-    : DEFAULT_DB_PATH;
-  const app = createApiApp(activeDbPath);
+
+  const storageBackend = resolveStorageBackend();
+  let app: express.Express;
+
+  if (storageBackend === 'postgres') {
+    const pgStore = new PostgresStore();
+    try {
+      await pgStore.initAndVerifyReady();
+    } catch (err: any) {
+      const msg =
+        err instanceof PgStorageUnavailableError
+          ? err.message
+          : 'PostgreSQL initialization failed.';
+      console.error(`[server] Fatal startup error (STORAGE_BACKEND=postgres): ${msg}`);
+      process.exit(1);
+    }
+    app = createApiApp(undefined, {
+      storageBackend: 'postgres',
+      postgresStore: pgStore,
+    });
+    console.log('[server] Storage backend active: PostgreSQL (Neon development verified)');
+  } else {
+    const activeDbPath = process.env.CFA_DB_PATH
+      ? path.resolve(process.env.CFA_DB_PATH)
+      : DEFAULT_DB_PATH;
+    app = createApiApp(activeDbPath, { storageBackend: 'json' });
+    console.log('[server] Storage backend active: JSON file store');
+  }
+
   await attachFrontendMiddleware(app);
 
   app.listen(port, host, () => {

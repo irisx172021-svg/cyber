@@ -30,10 +30,16 @@ import {
 import { getLessonContext } from '../src/server/groqTutor';
 import { Lesson, Tier, UserProgress } from '../src/types';
 import { TestCookieClient } from './testHttpClient';
+import {
+  assertLiveDbUnchanged,
+  createLegacyV1PrePhase1Fixture,
+  snapshotFileSha256,
+} from './testFixtures';
 
 process.env.CFA_NO_LISTEN = '1';
 
 async function runTests() {
+  const preRunLiveSha = snapshotFileSha256(path.join(process.cwd(), 'database.json'));
   const results: Array<{ name: string; status: 'PASS' | 'INFO'; detail: string }> = [];
   const record = (name: string, detail: string, status: 'PASS' | 'INFO' = 'PASS') => {
     results.push({ name, status, detail });
@@ -249,9 +255,8 @@ async function runTests() {
     'Verified root unlock, mandatory lock/explanation, non-blocking recommendations, and completed-lesson preservation'
   );
 
-  // 4. Progress Migration Tests on Copy of database.json + Synthetic Edge Cases
-  const testCopyPath = path.join(process.cwd(), 'backups', 'pre-phase1', 'database.test-copy.json');
-  const rawCopy = JSON.parse(fs.readFileSync(testCopyPath, 'utf-8'));
+  // 4. Progress Migration Tests on Isolated Legacy Fixture + Synthetic Edge Cases
+  const rawCopy = createLegacyV1PrePhase1Fixture();
   assert.equal(needsSchemaMigration(rawCopy), true);
 
   const migratedCopy = migrateDatabaseSchema(rawCopy, ACADEMY_CURRICULUM);
@@ -330,10 +335,10 @@ async function runTests() {
     `All ${lessonIdx.size} lessons resolve practical labs cleanly + legacy ID lookup verified for net-osi-tcp`
   );
 
-  // 6. Live Express API Integration Tests (against temporary isolated copy of database.json)
+  // 6. Live Express API Integration Tests (against temporary isolated copy of baseline fixture)
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfa-phase1-test-'));
   const tmpDbPath = path.join(tmpDir, 'database.json');
-  fs.copyFileSync(testCopyPath, tmpDbPath);
+  fs.writeFileSync(tmpDbPath, JSON.stringify(rawCopy, null, 2), 'utf-8');
 
   const { createApiApp } = await import('../server');
   const app = createApiApp(tmpDbPath, {
@@ -499,6 +504,7 @@ async function runTests() {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 
+  assertLiveDbUnchanged(preRunLiveSha);
   console.log(`\nALL PHASE 1 VERIFICATION CHECKS COMPLETED (${results.length} suites).`);
 }
 

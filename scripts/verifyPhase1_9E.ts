@@ -10,6 +10,11 @@ import {
   TRUSTED_AI_STUDIO_FRAME_ANCESTORS,
 } from '../src/server/security';
 import { TestCookieClient } from './testHttpClient';
+import {
+  assertLiveDbUnchanged,
+  snapshotFileSha256,
+  writeBaselineFixtureCopy,
+} from './testFixtures';
 
 process.env.CFA_NO_LISTEN = '1';
 
@@ -86,7 +91,7 @@ async function runTests() {
   };
 
   const rootDir = process.cwd();
-  const baseDbCopy = path.join(rootDir, 'backups', 'pre-phase1', 'database.test-copy.json');
+  const preRunLiveSha = snapshotFileSha256(path.join(rootDir, 'database.json'));
   const expectedPreviewAncestors = TRUSTED_AI_STUDIO_FRAME_ANCESTORS.join(' ');
 
   // =========================================================================
@@ -207,7 +212,7 @@ async function runTests() {
   // =========================================================================
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfa-p19e-http-'));
   const dbPath = path.join(tmpDir, 'database.json');
-  fs.copyFileSync(baseDbCopy, dbPath);
+  writeBaselineFixtureCopy(dbPath);
 
   const prevNodeEnv = process.env.NODE_ENV;
   const prevDisableHmr = process.env.DISABLE_HMR;
@@ -379,6 +384,7 @@ async function runTests() {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 
+  assertLiveDbUnchanged(preRunLiveSha, rootDir);
   console.log('\nALL PHASE 1.9E VERIFICATION CHECKS PASSED!');
 }
 

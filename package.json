@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "tsx server.ts",
+    "dev": "rm -f /tmp/p2c-verify.json && tsx scripts/verifyPhase2_5P2C.ts --out /tmp/p2c-verify.json && STORAGE_BACKEND=postgres tsx server.ts",
     "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --outfile=dist/server/server.cjs",
     "start": "node dist/server/server.cjs",
     "clean": "rm -rf dist server.js",

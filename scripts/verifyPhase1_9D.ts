@@ -9,6 +9,11 @@ import { indexCurriculumLessons } from '../src/lib/curriculumProgress';
 import { isScryptHash } from '../src/server/auth';
 import { DbSchema } from '../src/server/migration';
 import { TestCookieClient } from './testHttpClient';
+import {
+  assertLiveDbUnchanged,
+  snapshotFileSha256,
+  writeBaselineFixtureCopy,
+} from './testFixtures';
 
 process.env.CFA_NO_LISTEN = '1';
 
@@ -66,7 +71,7 @@ async function runTests() {
   };
 
   const rootDir = process.cwd();
-  const baseDbCopy = path.join(rootDir, 'backups', 'pre-phase1', 'database.test-copy.json');
+  const preRunLiveSha = snapshotFileSha256(path.join(rootDir, 'database.json'));
   const lessonIdx = indexCurriculumLessons(ACADEMY_CURRICULUM);
 
   // =========================================================================
@@ -74,7 +79,7 @@ async function runTests() {
   // =========================================================================
   const assessDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfa-p19d-assess-'));
   const assessDb = path.join(assessDir, 'database.json');
-  fs.copyFileSync(baseDbCopy, assessDb);
+  writeBaselineFixtureCopy(assessDb);
 
   const assessServer = await startTempServer(assessDb, {
     sessionSecret: TEST_SECRET,
@@ -233,7 +238,7 @@ async function runTests() {
   // =========================================================================
   const voteDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfa-p19d-vote-'));
   const voteDb = path.join(voteDir, 'database.json');
-  fs.copyFileSync(baseDbCopy, voteDb);
+  writeBaselineFixtureCopy(voteDb);
 
   const voteServer = await startTempServer(voteDb, {
     sessionSecret: TEST_SECRET,
@@ -354,7 +359,7 @@ async function runTests() {
   // =========================================================================
   const hdrDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfa-p19d-hdr-'));
   const hdrDb = path.join(hdrDir, 'database.json');
-  fs.copyFileSync(baseDbCopy, hdrDb);
+  writeBaselineFixtureCopy(hdrDb);
 
   const prevNodeEnv = process.env.NODE_ENV;
   const prevSecret = process.env.AUTH_SESSION_SECRET;
@@ -430,7 +435,7 @@ async function runTests() {
   // =========================================================================
   const pathDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfa-p19d-path-'));
   const pathDb = path.join(pathDir, 'database.json');
-  fs.copyFileSync(baseDbCopy, pathDb);
+  writeBaselineFixtureCopy(pathDb);
 
   const sensitivePaths = [
     '/database.json',
@@ -523,13 +528,10 @@ async function runTests() {
   }
 
   // =========================================================================
-  // 5. PRODUCTION DATABASE.JSON PRESERVATION
+  // 5. LIVE DATABASE.JSON PRESERVATION
   // =========================================================================
+  const liveCheck = assertLiveDbUnchanged(preRunLiveSha, rootDir);
   const prodDb = JSON.parse(fs.readFileSync(path.join(rootDir, 'database.json'), 'utf-8')) as DbSchema;
-  assert.equal(prodDb.accounts.length, 6);
-  for (const acc of prodDb.accounts) {
-    assert.equal(isScryptHash(acc.passwordHash), true);
-  }
   const prodP1 = prodDb.posts.find((p) => p.id === 'post-001');
   const prodP2 = prodDb.posts.find((p) => p.id === 'post-002');
   assert.ok(prodP1 && prodP1.upvotes === 42);
@@ -537,8 +539,8 @@ async function runTests() {
 
   pass(
     'Data Preservation',
-    'Production database.json Accounts & Historical Posts Integrity',
-    `Verified all ${prodDb.accounts.length} original accounts and historical forum posts preserved unmodified`
+    'Live database.json Accounts & Historical Posts Integrity',
+    `Verified all ${liveCheck.accountsCount} live accounts and historical forum posts preserved with unchanged SHA-256`
   );
 
   console.log(`\nALL ${results.length} PHASE 1.9D SECURITY VERIFICATION SUITES PASSED.`);

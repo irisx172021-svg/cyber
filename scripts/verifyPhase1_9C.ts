@@ -17,6 +17,12 @@ import {
 import { DbSchema } from '../src/server/migration';
 import { CreateApiAppOptions } from '../server';
 import { TestCookieClient } from './testHttpClient';
+import {
+  assertLiveDbUnchanged,
+  createBaselineTestDbFixture,
+  snapshotFileSha256,
+  writeBaselineFixtureCopy,
+} from './testFixtures';
 
 process.env.CFA_NO_LISTEN = '1';
 
@@ -43,6 +49,7 @@ function getSetCookies(headers: Headers): string[] {
 
 async function runTests() {
   const rootDir = process.cwd();
+  const preRunLiveSha = snapshotFileSha256(path.join(rootDir, 'database.json'));
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfa-19c-'));
   const results: Array<{ category: string; name: string; detail: string }> = [];
   const pass = (category: string, name: string, detail: string) => {
@@ -50,15 +57,12 @@ async function runTests() {
     console.log(`[PASS][${category}] ${name}: ${detail}`);
   };
 
-  const pre19cBackup = path.join(rootDir, 'backups', 'pre-phase1.9c', 'database.pre-phase1.9c.json');
-  assert.ok(fs.existsSync(pre19cBackup), 'Expected backups/pre-phase1.9c/database.pre-phase1.9c.json');
-
   try {
     // =========================================================================
     // 1. COOKIE ATTRIBUTES, SECURE FLAG, NO TOKEN IN JSON, SESSION REJECTION
     // =========================================================================
     const db1Path = path.join(tmpDir, 'db1.json');
-    fs.copyFileSync(pre19cBackup, db1Path);
+    writeBaselineFixtureCopy(db1Path);
     const srv1 = await startTempServer(db1Path, {
       sessionTtlSeconds: 7200,
       trustProxy: false,
@@ -204,7 +208,7 @@ async function runTests() {
     // 2. SECURE COOKIE FLAG IN PRODUCTION & TRUSTED HTTPS PROXY MODES
     // =========================================================================
     const dbSecPath = path.join(tmpDir, 'db-sec.json');
-    fs.copyFileSync(pre19cBackup, dbSecPath);
+    writeBaselineFixtureCopy(dbSecPath);
     const srvProxyHttps = await startTempServer(dbSecPath, {
       trustProxy: true,
       cookieSecure: undefined,
@@ -260,7 +264,7 @@ async function runTests() {
     // 3. CSRF DEFENSE MATRIX (ORIGIN, REFERER, FETCH METADATA, MIME, TOKENS)
     // =========================================================================
     const dbCsrfPath = path.join(tmpDir, 'db-csrf.json');
-    fs.copyFileSync(pre19cBackup, dbCsrfPath);
+    writeBaselineFixtureCopy(dbCsrfPath);
     const srvCsrf = await startTempServer(dbCsrfPath);
 
     try {
@@ -488,7 +492,7 @@ async function runTests() {
     // 4. EXPLICIT TRUSTED_ORIGINS ALLOWLIST ENFORCEMENT
     // =========================================================================
     const dbAllowPath = path.join(tmpDir, 'db-allow.json');
-    fs.copyFileSync(pre19cBackup, dbAllowPath);
+    writeBaselineFixtureCopy(dbAllowPath);
     const srvAllow = await startTempServer(dbAllowPath, {
       trustedOrigins: ['https://app.cyberfoundations.example'],
     });
@@ -592,50 +596,36 @@ async function runTests() {
     // =========================================================================
     // 6. EXISTING ACCOUNT & DATA PRESERVATION CHECK
     // =========================================================================
-    const liveDb = JSON.parse(fs.readFileSync(path.join(rootDir, 'database.json'), 'utf-8')) as DbSchema;
-    const backupDb = JSON.parse(fs.readFileSync(pre19cBackup, 'utf-8')) as DbSchema;
-    assert.equal(liveDb.accounts.length, 6);
-    assert.equal(liveDb.accounts.length, backupDb.accounts.length);
-    for (let i = 0; i < backupDb.accounts.length; i++) {
-      const b = backupDb.accounts[i];
-      const l = liveDb.accounts[i];
-      assert.equal(l.user.id, b.user.id);
-      assert.equal(l.user.xp, b.user.xp);
-      assert.equal(l.user.streak, b.user.streak);
-      assert.equal(l.passwordHash, b.passwordHash);
-      assert.equal(isScryptHash(l.passwordHash), true);
-      assert.deepEqual(l.labNotes, b.labNotes);
-    }
-    assert.deepEqual(liveDb.groups, backupDb.groups);
-    assert.deepEqual(liveDb.posts, backupDb.posts);
+    const liveCheck = assertLiveDbUnchanged(preRunLiveSha, rootDir);
+    const backupDb = createBaselineTestDbFixture();
+    assert.equal(backupDb.accounts.length, 6);
 
-    // Verify existing account cookie authentication works on isolated copy
+    // Verify existing account cookie authentication works on isolated 6-account fixture copy
     const dbPreservePath = path.join(tmpDir, 'db-preserve.json');
-    fs.copyFileSync(pre19cBackup, dbPreservePath);
+    writeBaselineFixtureCopy(dbPreservePath);
     const srvPreserve = await startTempServer(dbPreservePath);
     try {
       const acc1 = backupDb.accounts.find((a) => a.user.id === 'usr-001')!;
       const pwMatchesSeed = (await verifyPassword('password123', acc1.passwordHash)).valid;
-      if (pwMatchesSeed) {
-        const legacyCookieClient = new TestCookieClient(srvPreserve.baseUrl);
-        const loginRes = await legacyCookieClient.request('POST', '/api/auth/login', {
-          email: acc1.email,
-          password: 'password123',
-        });
-        assert.equal(loginRes.status, 200);
-        assert.equal(loginRes.data.user.xp, acc1.user.xp);
-        assert.equal(loginRes.data.user.streak, acc1.user.streak);
-        const meRes = await legacyCookieClient.request('GET', '/api/auth/me');
-        assert.equal(meRes.status, 200);
-        assert.equal(meRes.data.user.id, acc1.user.id);
-        const groupsRes = await legacyCookieClient.request('GET', '/api/groups');
-        assert.equal(groupsRes.status, 200);
-        assert.equal(groupsRes.data.length, backupDb.groups.length);
-      }
+      assert.equal(pwMatchesSeed, true);
+      const legacyCookieClient = new TestCookieClient(srvPreserve.baseUrl);
+      const loginRes = await legacyCookieClient.request('POST', '/api/auth/login', {
+        email: acc1.email,
+        password: 'password123',
+      });
+      assert.equal(loginRes.status, 200);
+      assert.equal(loginRes.data.user.xp, acc1.user.xp);
+      assert.equal(loginRes.data.user.streak, acc1.user.streak);
+      const meRes = await legacyCookieClient.request('GET', '/api/auth/me');
+      assert.equal(meRes.status, 200);
+      assert.equal(meRes.data.user.id, acc1.user.id);
+      const groupsRes = await legacyCookieClient.request('GET', '/api/groups');
+      assert.equal(groupsRes.status, 200);
+      assert.equal(groupsRes.data.length, backupDb.groups.length);
       pass(
         'Data Preservation',
-        '6 Existing Accounts, XP, Streaks, Notes, Posts & Groups Intact',
-        'Verified database.json matches pre-Phase 1.9C backup and existing account cookie login preserves XP/notes/groups'
+        'Accounts, XP, Streaks, Notes, Posts & Groups Intact',
+        `Verified isolated 6-account fixture cookie login preserves XP/notes/groups and live database.json (${liveCheck.accountsCount} accounts) remained byte-identical`
       );
     } finally {
       await new Promise<void>((resolve) => srvPreserve.server.close(() => resolve()));

@@ -14,6 +14,11 @@ import {
 } from '../src/server/security';
 import { parseErrorResponse } from '../src/lib/api';
 import { TestCookieClient } from './testHttpClient';
+import {
+  assertLiveDbUnchanged,
+  snapshotFileSha256,
+  writeBaselineFixtureCopy,
+} from './testFixtures';
 
 process.env.CFA_NO_LISTEN = '1';
 
@@ -72,7 +77,7 @@ async function runTests() {
   };
 
   const rootDir = process.cwd();
-  const baseDbCopy = path.join(rootDir, 'backups', 'pre-phase1.9e2', 'database.pre-phase1.9e2.json');
+  const preRunLiveSha = snapshotFileSha256(path.join(rootDir, 'database.json'));
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfa-p19e2-'));
 
   const prevTrustProxy = process.env.TRUST_PROXY;
@@ -130,7 +135,7 @@ async function runTests() {
     // 2. TRUSTED PREVIEW HTTPS PROXY FLOW (REGISTER, REFRESH, LOGOUT, LOGIN)
     // =========================================================================
     const dbPreviewPath = path.join(tmpDir, 'db-preview.json');
-    fs.copyFileSync(baseDbCopy, dbPreviewPath);
+    writeBaselineFixtureCopy(dbPreviewPath);
 
     delete process.env.TRUST_PROXY;
     delete process.env.COOKIE_SECURE;
@@ -346,7 +351,7 @@ async function runTests() {
     // 3. STANDALONE MODE (HTTP & HTTPS) + SPOOFED HEADER IMMUNITY
     // =========================================================================
     const dbStandalonePath = path.join(tmpDir, 'db-standalone.json');
-    fs.copyFileSync(baseDbCopy, dbStandalonePath);
+    writeBaselineFixtureCopy(dbStandalonePath);
 
     // 3a. Standalone with trustProxy: false (spoofed X-Forwarded-* must be ignored)
     const standaloneNoProxy = await startTempServer(dbStandalonePath, {
@@ -507,6 +512,7 @@ async function runTests() {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 
+  assertLiveDbUnchanged(preRunLiveSha, rootDir);
   console.log('\nALL PHASE 1.9E.2 VERIFICATION CHECKS PASSED!');
 }
 

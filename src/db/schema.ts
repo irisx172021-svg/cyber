@@ -151,7 +151,10 @@ export const labNotes = pgTable(
     content: text('content').notNull(),
     lastSaved: text('last_saved').notNull(),
   },
-  (table) => [index('lab_notes_user_id_idx').on(table.userId)]
+  (table) => [
+    index('lab_notes_user_id_idx').on(table.userId),
+    index('lab_notes_user_saved_idx').on(table.userId, table.lastSaved),
+  ]
 );
 
 export const posts = pgTable(
@@ -253,13 +256,17 @@ export const groupMessages = pgTable(
   (table) => [index('group_messages_group_created_idx').on(table.groupId, table.createdAt)]
 );
 
-export const timelineEvents = pgTable('timeline_events', {
-  id: text('id').primaryKey(),
-  username: text('username').notNull(),
-  action: text('action').notNull(),
-  xpReward: integer('xp_reward').notNull().default(0),
-  timestamp: text('timestamp').notNull(),
-});
+export const timelineEvents = pgTable(
+  'timeline_events',
+  {
+    id: text('id').primaryKey(),
+    username: text('username').notNull(),
+    action: text('action').notNull(),
+    xpReward: integer('xp_reward').notNull().default(0),
+    timestamp: text('timestamp').notNull(),
+  },
+  (table) => [index('timeline_events_timestamp_idx').on(table.timestamp)]
+);
 
 export const revokedSessions = pgTable(
   'revoked_sessions',
@@ -278,3 +285,26 @@ export const migrationHistory = pgTable('migration_history', {
   summary: jsonb('summary').$type<Record<string, unknown>>().notNull(),
   appliedAt: timestamp('applied_at', { withTimezone: true }).notNull().defaultNow(),
 });
+
+export const recoverySnapshots = pgTable(
+  'recovery_snapshots',
+  {
+    id: serial('id').primaryKey(),
+    snapshotKey: text('snapshot_key').notNull().unique(),
+    sourceProjectId: text('source_project_id').notNull(),
+    sourceBranchId: text('source_branch_id').notNull(),
+    algorithm: text('algorithm').notNull().default('aes-256-gcm'),
+    kdf: text('kdf').notNull().default('hkdf-sha256'),
+    salt: text('salt').notNull(),
+    iv: text('iv').notNull(),
+    authTag: text('auth_tag').notNull(),
+    ciphertext: text('ciphertext').notNull(),
+    plaintextSha256: text('plaintext_sha256').notNull(),
+    accountCount: integer('account_count').notNull(),
+    aggregateXp: integer('aggregate_xp').notNull(),
+    completedLessonsCount: integer('completed_lessons_count').notNull(),
+    summary: jsonb('summary').$type<Record<string, unknown>>().notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index('recovery_snapshots_created_at_idx').on(table.createdAt)]
+);

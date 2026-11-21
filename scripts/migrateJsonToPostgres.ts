@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { isDeepStrictEqual } from 'util';
-import { eq } from 'drizzle-orm';
+import { and, eq, inArray, notInArray } from 'drizzle-orm';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { Pool } from 'pg';
@@ -15,7 +15,18 @@ import {
 } from '../src/db/client.ts';
 import { isScryptHash } from '../src/server/auth.ts';
 import { DbSchema } from '../src/server/migration.ts';
-import { normalizeHandle } from '../src/server/groups.ts';
+import { normalizeHandle, pruneExpiredInvitations } from '../src/server/groups.ts';
+import {
+  compareSourceJsonWithPg,
+  detectReseededSeedOverwrite,
+  detectSourceVsPgConflicts,
+  verifyCutoverParityGate,
+} from '../src/server/cutoverGuard.ts';
+import {
+  createAndStoreEncryptedNeonBackup,
+  exportDbSchemaFromPostgres,
+  verifyLatestEncryptedNeonBackup,
+} from '../src/server/recoveryBackup.ts';
 
 export const EXPECTED_BASELINE_SHA256 =
   'd94730b1aad0ae5434c29d23832e3ab77740fe8705fef0ce0d28dd99bd5485a3';
@@ -79,6 +90,50 @@ export function sha256File(filePath: string): string {
   return crypto.createHash('sha256').update(buf).digest('hex');
 }
 
+export function validateSourceDbForPgImport(parsed: DbSchema): void {
+  const emailLowerSet = new Set<string>();
+  const handleNormSet = new Set<string>();
+
+  for (const acc of parsed.accounts || []) {
+    if (!acc?.user?.id || !acc?.email || !acc?.user?.username) {
+      throw new Error('Source database contains an account missing id, email, or username.');
+    }
+    if (!isScryptHash(acc.passwordHash)) {
+      throw new Error(
+        `Refusing migration: account ${acc.user.id} does not have a valid salted scrypt passwordHash.`
+      );
+    }
+
+    const emailKey = acc.email.trim().toLowerCase();
+    if (emailLowerSet.has(emailKey)) {
+      throw new Error(`Case-insensitive duplicate email in source JSON: ${emailKey}`);
+    }
+    emailLowerSet.add(emailKey);
+
+    const handleKey = normalizeHandle(acc.user.username);
+    if (handleNormSet.has(handleKey)) {
+      throw new Error(`Normalized duplicate username in source JSON: ${handleKey}`);
+    }
+    handleNormSet.add(handleKey);
+
+    const userXp = acc.user.xp ?? 0;
+    const progXp = acc.progress?.xp ?? userXp;
+    const userStreak = acc.user.streak ?? 0;
+    const progStreak = acc.progress?.streak ?? userStreak;
+    if (!Number.isFinite(userXp) || userXp < 0 || !Number.isFinite(progXp) || progXp < 0) {
+      throw new Error(`Negative or non-finite XP detected for account ${acc.user.id}`);
+    }
+    if (!Number.isFinite(userStreak) || userStreak < 0 || !Number.isFinite(progStreak) || progStreak < 0) {
+      throw new Error(`Negative or non-finite streak detected for account ${acc.user.id}`);
+    }
+    if (userXp !== progXp || userStreak !== progStreak) {
+      throw new Error(
+        `users <-> user_progress parity mismatch in source JSON for account ${acc.user.id}`
+      );
+    }
+  }
+}
+
 export function loadValidatedSourceJson(sourcePath = DEFAULT_SOURCE_DB_PATH): {
   db: DbSchema;
   sha256: string;
@@ -95,19 +150,31 @@ export function loadValidatedSourceJson(sourcePath = DEFAULT_SOURCE_DB_PATH): {
     throw new Error('Source database JSON is malformed or missing accounts array.');
   }
 
-  for (const acc of parsed.accounts) {
-    if (!acc?.user?.id || !acc?.email || !acc?.user?.username) {
-      throw new Error('Source database contains an account missing id, email, or username.');
-    }
-    if (!isScryptHash(acc.passwordHash)) {
-      throw new Error(
-        `Refusing migration: account ${acc.user.id} does not have a valid salted scrypt passwordHash.`
-      );
-    }
-  }
+  validateSourceDbForPgImport(parsed);
 
   const metrics = computeSourceMetrics(parsed);
   return { db: parsed, sha256, metrics };
+}
+
+export function computeCanonicalXpEventsForAccount(acc: DbSchema['accounts'][number]): string[] {
+  const eventSet = new Set<string>(acc.progress?.awardedXpEventIds || []);
+  for (const qId of acc.progress?.completedQuizLessonIds || []) {
+    eventSet.add(`submit_quiz:${qId}`);
+  }
+  for (const hwId of acc.progress?.completedHomeworkLessonIds || []) {
+    eventSet.add(`verify_homework:${hwId}`);
+  }
+  for (const exId of acc.progress?.completedExerciseIds || []) {
+    eventSet.add(`complete_exercise:${exId}`);
+  }
+  const quizzes = new Set(acc.progress?.completedQuizLessonIds || []);
+  const homeworks = new Set(acc.progress?.completedHomeworkLessonIds || []);
+  for (const cId of acc.progress?.completedLessonIds || []) {
+    if (!quizzes.has(cId) && !homeworks.has(cId)) {
+      eventSet.add(`legacy_completed:${cId}`);
+    }
+  }
+  return Array.from(eventSet);
 }
 
 export function computeSourceMetrics(db: DbSchema): SourceMetrics {
@@ -135,7 +202,7 @@ export function computeSourceMetrics(db: DbSchema): SourceMetrics {
     completedQuizLessonsCount += (acc.progress?.completedQuizLessonIds || []).length;
     completedHomeworkLessonsCount += (acc.progress?.completedHomeworkLessonIds || []).length;
     legacyCompletedLessonsCount += (acc.progress?.legacyCompletedLessonIds || []).length;
-    xpEventsCount += (acc.progress?.awardedXpEventIds || []).length;
+    xpEventsCount += computeCanonicalXpEventsForAccount(acc).length;
     postXpDailyTotalsCount += Object.keys(acc.progress?.postXpDailyLog || {}).length;
     userFollowsCount += buildFollowRowsForAccount(acc, accounts).length;
     labExplorationCount += Object.keys(acc.labExploration || {}).length;
@@ -157,7 +224,7 @@ export function computeSourceMetrics(db: DbSchema): SourceMetrics {
   let groupMessagesCount = 0;
   for (const g of groups) {
     groupMembersCount += (g.members || []).length;
-    groupInvitationsCount += (g.invitations || []).length;
+    groupInvitationsCount += pruneExpiredInvitations(g.invitations).length;
     groupJoinRequestsCount += (g.joinRequests || []).length;
     groupMessagesCount += (g.messages || []).length;
   }
@@ -206,14 +273,14 @@ function buildFollowRowsForAccount(
   allAccounts: DbSchema['accounts']
 ): Array<typeof schema.userFollows.$inferInsert> {
   const rows: Array<typeof schema.userFollows.$inferInsert> = [];
-  const seenHandles = new Set<string>();
+  const seenNormalized = new Set<string>();
 
   for (const rawTarget of acc.user.following || []) {
     if (typeof rawTarget !== 'string' || !rawTarget.trim()) continue;
-    if (seenHandles.has(rawTarget)) continue;
-    seenHandles.add(rawTarget);
-
     const targetNorm = normalizeHandle(rawTarget);
+    if (seenNormalized.has(targetNorm)) continue;
+    seenNormalized.add(targetNorm);
+
     const targetAcc = allAccounts.find((a) => normalizeHandle(a.user.username) === targetNorm);
     const myNorm = normalizeHandle(acc.user.username);
     const recordedInTargetFollowers = Boolean(
@@ -257,15 +324,59 @@ export function buildDryRunPlan(db: DbSchema): MigrationPlanCounts {
   };
 }
 
+export async function detectZeroCaseCollisionsInPg(pool: Pool): Promise<{
+  ok: boolean;
+  emailCollisions: number;
+  usernameCollisions: number;
+  inviteCollisions: number;
+  joinRequestCollisions: number;
+}> {
+  const client = await pool.connect();
+  try {
+    await assertConfirmedDevNeonBranch(client);
+    const [emails, usernames, invites, reqs] = await Promise.all([
+      client.query<{ c: string }>(
+        `SELECT COUNT(*)::text AS c FROM (SELECT LOWER(email) FROM users GROUP BY LOWER(email) HAVING COUNT(*) > 1) s`
+      ),
+      client.query<{ c: string }>(
+        `SELECT COUNT(*)::text AS c FROM (SELECT LOWER(LTRIM(username, '@')) FROM users GROUP BY LOWER(LTRIM(username, '@')) HAVING COUNT(*) > 1) s`
+      ),
+      client.query<{ c: string }>(
+        `SELECT COUNT(*)::text AS c FROM (SELECT group_id, LOWER(LTRIM(username, '@')) FROM group_invitations GROUP BY group_id, LOWER(LTRIM(username, '@')) HAVING COUNT(*) > 1) s`
+      ),
+      client.query<{ c: string }>(
+        `SELECT COUNT(*)::text AS c FROM (SELECT group_id, LOWER(LTRIM(username, '@')) FROM group_join_requests GROUP BY group_id, LOWER(LTRIM(username, '@')) HAVING COUNT(*) > 1) s`
+      ),
+    ]);
+    const emailCollisions = Number(emails.rows[0]?.c ?? 0);
+    const usernameCollisions = Number(usernames.rows[0]?.c ?? 0);
+    const inviteCollisions = Number(invites.rows[0]?.c ?? 0);
+    const joinRequestCollisions = Number(reqs.rows[0]?.c ?? 0);
+    return {
+      ok:
+        emailCollisions === 0 &&
+        usernameCollisions === 0 &&
+        inviteCollisions === 0 &&
+        joinRequestCollisions === 0,
+      emailCollisions,
+      usernameCollisions,
+      inviteCollisions,
+      joinRequestCollisions,
+    };
+  } finally {
+    client.release();
+  }
+}
+
 export async function runDrizzleMigrationsOnConfirmedDev(
   pool: Pool,
   db: NodePgDatabase<typeof schema>
 ): Promise<void> {
-  const client = await pool.connect();
-  try {
-    await assertConfirmedDevNeonBranch(client);
-  } finally {
-    client.release();
+  const collisions = await detectZeroCaseCollisionsInPg(pool);
+  if (!collisions.ok) {
+    throw new Error(
+      `Refusing Drizzle migration: existing case-insensitive collisions detected (${JSON.stringify(collisions)}).`
+    );
   }
 
   const migrationsFolder = path.resolve(process.cwd(), 'drizzle');
@@ -278,12 +389,23 @@ export async function importJsonToPostgres(options: {
   sourceDb: DbSchema;
   sourceSha256: string;
   dryRun?: boolean;
+  reconcileRemovedRecords?: boolean;
+  skipReseedGuardForTesting?: boolean;
 }): Promise<{
   dryRun: boolean;
   plannedCounts: MigrationPlanCounts;
   migrationKey: string;
 }> {
-  const { pool, db, sourceDb, sourceSha256, dryRun = false } = options;
+  const {
+    pool,
+    db,
+    sourceDb,
+    sourceSha256,
+    dryRun = false,
+    reconcileRemovedRecords = false,
+    skipReseedGuardForTesting = false,
+  } = options;
+  validateSourceDbForPgImport(sourceDb);
   const plannedCounts = buildDryRunPlan(sourceDb);
   const migrationKey = `json-to-pg-v${sourceDb.schemaVersion ?? 2}-${sourceSha256.slice(0, 16)}`;
 
@@ -298,10 +420,28 @@ export async function importJsonToPostgres(options: {
     return { dryRun: true, plannedCounts, migrationKey };
   }
 
+  if (!skipReseedGuardForTesting) {
+    const existingPgDb = await exportDbSchemaFromPostgres(db);
+    if (existingPgDb.accounts.length > 0) {
+      const reseedGuard = detectReseededSeedOverwrite(sourceDb, existingPgDb);
+      if (reseedGuard.blocked) {
+        throw new Error(reseedGuard.reason);
+      }
+      const conflictGuard = detectSourceVsPgConflicts(sourceDb, existingPgDb);
+      if (conflictGuard.isStaleSource) {
+        throw new Error(
+          `Refusing stale overwrite of PostgreSQL: ${conflictGuard.reasons.join('; ')}`
+        );
+      }
+    }
+  }
+
   const accounts = sourceDb.accounts || [];
 
   await db.transaction(async (tx) => {
     for (const acc of accounts) {
+      const authoritativeXp = acc.progress?.xp ?? acc.user.xp ?? 0;
+      const authoritativeStreak = acc.progress?.streak ?? acc.user.streak ?? 0;
       await tx
         .insert(schema.users)
         .values({
@@ -310,8 +450,8 @@ export async function importJsonToPostgres(options: {
           username: acc.user.username,
           passwordHash: acc.passwordHash,
           tokenVersion: acc.tokenVersion ?? 1,
-          xp: acc.user.xp,
-          streak: acc.user.streak,
+          xp: authoritativeXp,
+          streak: authoritativeStreak,
           level: acc.user.level,
           rank: acc.user.rank,
           completion: acc.user.completion,
@@ -328,8 +468,8 @@ export async function importJsonToPostgres(options: {
             username: acc.user.username,
             passwordHash: acc.passwordHash,
             tokenVersion: acc.tokenVersion ?? 1,
-            xp: acc.user.xp,
-            streak: acc.user.streak,
+            xp: authoritativeXp,
+            streak: authoritativeStreak,
             level: acc.user.level,
             rank: acc.user.rank,
             completion: acc.user.completion,
@@ -353,8 +493,8 @@ export async function importJsonToPostgres(options: {
           completedQuizLessonIds: [...(prog.completedQuizLessonIds || [])],
           completedHomeworkLessonIds: [...(prog.completedHomeworkLessonIds || [])],
           legacyCompletedLessonIds: [...(prog.legacyCompletedLessonIds || [])],
-          xp: prog.xp,
-          streak: prog.streak,
+          xp: authoritativeXp,
+          streak: authoritativeStreak,
           lastActiveDate: prog.lastActiveDate ?? null,
           lastStreakUpdate: prog.lastStreakUpdate ?? null,
           lastActiveTimestamp: prog.lastActiveTimestamp ?? null,
@@ -370,8 +510,8 @@ export async function importJsonToPostgres(options: {
             completedQuizLessonIds: [...(prog.completedQuizLessonIds || [])],
             completedHomeworkLessonIds: [...(prog.completedHomeworkLessonIds || [])],
             legacyCompletedLessonIds: [...(prog.legacyCompletedLessonIds || [])],
-            xp: prog.xp,
-            streak: prog.streak,
+            xp: authoritativeXp,
+            streak: authoritativeStreak,
             lastActiveDate: prog.lastActiveDate ?? null,
             lastStreakUpdate: prog.lastStreakUpdate ?? null,
             lastActiveTimestamp: prog.lastActiveTimestamp ?? null,
@@ -380,7 +520,9 @@ export async function importJsonToPostgres(options: {
           },
         });
 
-      for (const eventId of prog.awardedXpEventIds || []) {
+      // Synthesize legacy XP events alongside explicit awardedXpEventIds so historical completions cannot double-award XP
+      const canonicalXpEvents = computeCanonicalXpEventsForAccount(acc);
+      for (const eventId of canonicalXpEvents) {
         await tx
           .insert(schema.xpEvents)
           .values({
@@ -603,7 +745,15 @@ export async function importJsonToPostgres(options: {
           });
       }
 
-      for (const inv of grp.invitations || []) {
+      const validInvites = pruneExpiredInvitations(grp.invitations);
+      const seenInviteNorm = new Set<string>();
+      const activeInviteIds: string[] = [];
+      for (const inv of validInvites) {
+        const invNorm = normalizeHandle(inv.username);
+        if (seenInviteNorm.has(invNorm)) continue;
+        seenInviteNorm.add(invNorm);
+        activeInviteIds.push(inv.id);
+
         await tx
           .insert(schema.groupInvitations)
           .values({
@@ -626,7 +776,14 @@ export async function importJsonToPostgres(options: {
           });
       }
 
+      const seenReqNorm = new Set<string>();
+      const activeReqIds: string[] = [];
       for (const req of grp.joinRequests || []) {
+        const reqNorm = normalizeHandle(req.username);
+        if (seenReqNorm.has(reqNorm)) continue;
+        seenReqNorm.add(reqNorm);
+        activeReqIds.push(req.id);
+
         await tx
           .insert(schema.groupJoinRequests)
           .values({
@@ -643,6 +800,52 @@ export async function importJsonToPostgres(options: {
               requestedAt: req.requestedAt,
             },
           });
+      }
+
+      if (reconcileRemovedRecords) {
+        const activeMembers = grp.members || [];
+        if (activeMembers.length > 0) {
+          await tx
+            .delete(schema.groupMembers)
+            .where(
+              and(
+                eq(schema.groupMembers.groupId, grp.id),
+                notInArray(schema.groupMembers.memberHandle, activeMembers)
+              )
+            );
+        } else {
+          await tx.delete(schema.groupMembers).where(eq(schema.groupMembers.groupId, grp.id));
+        }
+
+        if (activeInviteIds.length > 0) {
+          await tx
+            .delete(schema.groupInvitations)
+            .where(
+              and(
+                eq(schema.groupInvitations.groupId, grp.id),
+                notInArray(schema.groupInvitations.id, activeInviteIds)
+              )
+            );
+        } else {
+          await tx
+            .delete(schema.groupInvitations)
+            .where(eq(schema.groupInvitations.groupId, grp.id));
+        }
+
+        if (activeReqIds.length > 0) {
+          await tx
+            .delete(schema.groupJoinRequests)
+            .where(
+              and(
+                eq(schema.groupJoinRequests.groupId, grp.id),
+                notInArray(schema.groupJoinRequests.id, activeReqIds)
+              )
+            );
+        } else {
+          await tx
+            .delete(schema.groupJoinRequests)
+            .where(eq(schema.groupJoinRequests.groupId, grp.id));
+        }
       }
 
       for (const msg of grp.messages || []) {
@@ -708,6 +911,48 @@ export async function importJsonToPostgres(options: {
           target: schema.revokedSessions.sid,
           set: { exp: rev.exp },
         });
+    }
+
+    if (reconcileRemovedRecords) {
+      for (const acc of accounts) {
+        const noteIds = (acc.labNotes || []).map((n) => n.id);
+        if (noteIds.length > 0) {
+          await tx
+            .delete(schema.labNotes)
+            .where(and(eq(schema.labNotes.userId, acc.user.id), notInArray(schema.labNotes.id, noteIds)));
+        } else {
+          await tx.delete(schema.labNotes).where(eq(schema.labNotes.userId, acc.user.id));
+        }
+
+        const followHandles = buildFollowRowsForAccount(acc, accounts).map((f) => f.followedHandle);
+        if (followHandles.length > 0) {
+          await tx
+            .delete(schema.userFollows)
+            .where(
+              and(
+                eq(schema.userFollows.followerUserId, acc.user.id),
+                notInArray(schema.userFollows.followedHandle, followHandles)
+              )
+            );
+        } else {
+          await tx
+            .delete(schema.userFollows)
+            .where(eq(schema.userFollows.followerUserId, acc.user.id));
+        }
+      }
+
+      for (const post of sourceDb.posts || []) {
+        const voterIds = Object.keys(post.votesByUserId || {});
+        if (voterIds.length > 0) {
+          await tx
+            .delete(schema.postVotes)
+            .where(
+              and(eq(schema.postVotes.postId, post.id), notInArray(schema.postVotes.userId, voterIds))
+            );
+        } else {
+          await tx.delete(schema.postVotes).where(eq(schema.postVotes.postId, post.id));
+        }
+      }
     }
 
     await tx
@@ -1003,12 +1248,60 @@ export async function verifySourceToPostgresParity(
 async function runCli(): Promise<void> {
   const args = new Set(process.argv.slice(2));
   const dryRun = args.has('--dry-run');
+  const auditOnly = args.has('--audit');
+  const backupEncrypted = args.has('--backup-encrypted');
   const applyMigrations = !dryRun || args.has('--migrate');
 
   const pool = createNeonPool();
   const db = createDrizzleDb(pool);
 
   try {
+    if (auditOnly) {
+      const pgDb = await exportDbSchemaFromPostgres(db);
+      const { db: sourceDb, sha256 } = loadValidatedSourceJson();
+      const comparison = compareSourceJsonWithPg(sourceDb, pgDb);
+      const reseedGuard = detectReseededSeedOverwrite(sourceDb, pgDb);
+      const parityGate = await verifyCutoverParityGate(db);
+      console.log(
+        JSON.stringify(
+          {
+            ok: true,
+            mode: 'audit-only',
+            localJsonSha256: sha256,
+            comparison,
+            reseedGuard,
+            parityGate,
+          },
+          null,
+          2
+        )
+      );
+      return;
+    }
+
+    if (backupEncrypted) {
+      const secret = (process.env.AUTH_SESSION_SECRET || '').trim();
+      await runDrizzleMigrationsOnConfirmedDev(pool, db);
+      const created = await createAndStoreEncryptedNeonBackup(pool, db, secret, {
+        reason: 'manual-cli-backup',
+      });
+      const verified = await verifyLatestEncryptedNeonBackup(pool, db, secret, created.snapshotKey);
+      console.log(
+        JSON.stringify(
+          {
+            ok: verified.ok,
+            mode: 'backup-encrypted',
+            created,
+            verified,
+          },
+          null,
+          2
+        )
+      );
+      if (!verified.ok) process.exitCode = 1;
+      return;
+    }
+
     const { db: sourceDb, sha256, metrics } = loadValidatedSourceJson();
     if (applyMigrations && !dryRun) {
       await runDrizzleMigrationsOnConfirmedDev(pool, db);

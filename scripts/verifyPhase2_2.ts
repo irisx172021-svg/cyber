@@ -15,6 +15,11 @@ import {
   validateServerHomeworkOutput,
 } from '../src/server/assessments';
 import { TestCookieClient } from './testHttpClient';
+import {
+  assertLiveDbUnchanged,
+  snapshotFileSha256,
+  writeBaselineFixtureCopy,
+} from './testFixtures';
 
 process.env.CFA_NO_LISTEN = '1';
 
@@ -65,6 +70,7 @@ async function runTests() {
   };
 
   const rootDir = process.cwd();
+  const preRunLiveSha = snapshotFileSha256(path.join(rootDir, 'database.json'));
   const lessonIdx = indexCurriculumLessons(ACADEMY_CURRICULUM);
 
   // =========================================================================
@@ -278,7 +284,7 @@ async function runTests() {
   // =========================================================================
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfa-p22-test-'));
   const tmpDbPath = path.join(tmpDir, 'database.json');
-  fs.copyFileSync(path.join(rootDir, 'backups', 'pre-phase1', 'database.test-copy.json'), tmpDbPath);
+  writeBaselineFixtureCopy(tmpDbPath);
 
   const srv = await startTempServer(tmpDbPath, {
     sessionSecret: TEST_SECRET,
@@ -574,19 +580,14 @@ async function runTests() {
   }
 
   // =========================================================================
-  // 6. PRODUCTION database.json BYTE-FOR-BYTE PRESERVATION CHECK
+  // 6. LIVE database.json BYTE-FOR-BYTE PRESERVATION CHECK
   // =========================================================================
-  const liveDbBytes = fs.readFileSync(path.join(rootDir, 'database.json'));
-  const backupDbPath = path.join(rootDir, 'backups', 'pre-phase2.2-20261118-162900', 'database.json');
-  const backupDbBytes = fs.readFileSync(backupDbPath);
-  const liveHash = crypto.createHash('sha256').update(liveDbBytes).digest('hex');
-  const backupHash = crypto.createHash('sha256').update(backupDbBytes).digest('hex');
-  assert.equal(liveHash, backupHash, 'Live database.json must remain byte-for-byte identical to pre-Phase 2.2 backup');
+  const liveCheck = assertLiveDbUnchanged(preRunLiveSha, rootDir);
 
   pass(
     'Data Preservation',
-    'Production database.json Byte-Identical Check',
-    `SHA-256 verified identical (${liveHash.slice(0, 16)}...) across all 6 accounts, XP, progress, notes, posts, timeline, and groups`
+    'Live database.json Byte-Identical Check',
+    `SHA-256 verified identical (${liveCheck.liveSha256.slice(0, 16)}...) across all ${liveCheck.accountsCount} live accounts`
   );
 
   console.log(`\nALL ${results.length} PHASE 2.2 VERIFICATION SUITES PASSED.`);

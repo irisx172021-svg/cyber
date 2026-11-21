@@ -18,8 +18,13 @@ import { buildTutorLessonContent, buildTutorSystemPrompt, getLessonContext } fro
 import { DbSchema, migrateDatabaseSchema } from '../src/server/migration';
 import { UserProgress } from '../src/types';
 import { TestCookieClient } from './testHttpClient';
-import { ACADEMY_CURRICULUM as PRE_23_CURRICULUM } from '../backups/pre-phase2.3-20261118-090200/src/data/curriculum';
-import { ALL_PRACTICAL_LABS as PRE_23_LABS } from '../backups/pre-phase2.3-20261118-090200/src/data/practicalLabs';
+import {
+  assertLiveDbUnchanged,
+  assertPre23BaselinePreserved,
+  createBaselineTestDbFixture,
+  snapshotFileSha256,
+  writeBaselineFixtureCopy,
+} from './testFixtures';
 
 process.env.CFA_NO_LISTEN = '1';
 
@@ -95,6 +100,7 @@ async function runTests() {
   };
 
   const rootDir = process.cwd();
+  const preRunLiveSha = snapshotFileSha256(path.join(rootDir, 'database.json'));
   const lessonIdx = indexCurriculumLessons(ACADEMY_CURRICULUM);
 
   // =========================================================================
@@ -124,38 +130,8 @@ async function runTests() {
   const freshStats = computeCurriculumStats(ACADEMY_CURRICULUM, freshProgress);
   assert.equal(freshStats.totalLessons, 76);
 
-  // Compare against pre-2.3 backup snapshot: every original ID & original correctOption preserved
-  const preLessons = PRE_23_CURRICULUM.flatMap((t: any) =>
-    t.topics.flatMap((tp: any) => tp.lessons)
-  );
-  assert.equal(preLessons.length, 69);
-  assert.equal(PRE_23_LABS.length, 69);
-
-  const liveQuizById = new Map(allQuestions.map((q) => [q.id, q]));
-  const liveLabById = new Map(ALL_PRACTICAL_LABS.map((l) => [l.id, l]));
-
-  for (const oldLesson of preLessons) {
-    assert.ok(lessonIdx.has(oldLesson.id), `Missing preserved lesson ID: ${oldLesson.id}`);
-    const liveLesson = lessonIdx.get(oldLesson.id)!.lesson;
-    assert.notEqual(
-      liveLesson.completionRequirements?.requirePracticalLab,
-      true,
-      `Lesson ${liveLesson.id} must keep requirePracticalLab false/unset`
-    );
-    assert.equal(liveLesson.completionRequirements?.minQuizScorePercent ?? 100, 100);
-    for (const oldQ of oldLesson.quiz) {
-      const liveQ = liveQuizById.get(oldQ.id);
-      assert.ok(liveQ, `Missing preserved quiz ID: ${oldQ.id}`);
-      assert.equal(
-        liveQ!.correctOption,
-        oldQ.correctOption,
-        `Quiz ${oldQ.id} altered correctOption (${oldQ.correctOption} -> ${liveQ!.correctOption})`
-      );
-    }
-  }
-  for (const oldLab of PRE_23_LABS) {
-    assert.ok(liveLabById.has(oldLab.id), `Missing preserved lab ID: ${oldLab.id}`);
-  }
+  // Verify all 69 pre-2.3 lessons, 69 labs & 276 quiz questions preserved alongside 7 new modules
+  assertPre23BaselinePreserved(ACADEMY_CURRICULUM, ALL_PRACTICAL_LABS, NEW_MODULE_IDS);
   for (const newId of NEW_MODULE_IDS) {
     assert.ok(lessonIdx.has(newId), `Missing new module lesson: ${newId}`);
     assert.ok(getPracticalLabForLesson(newId), `Missing new practical lab for ${newId}`);
@@ -185,9 +161,9 @@ async function runTests() {
   }
   assert.deepEqual(inversions, [], `Prerequisite difficulty inversions found: ${inversions.join('; ')}`);
 
-  const liveDbRaw = JSON.parse(fs.readFileSync(path.join(rootDir, 'database.json'), 'utf-8')) as DbSchema;
-  assert.equal(liveDbRaw.accounts.length, 6);
-  const migratedView = migrateDatabaseSchema(JSON.parse(JSON.stringify(liveDbRaw)), ACADEMY_CURRICULUM);
+  const fixtureDbRaw = createBaselineTestDbFixture() as DbSchema;
+  assert.equal(fixtureDbRaw.accounts.length, 6);
+  const migratedView = migrateDatabaseSchema(JSON.parse(JSON.stringify(fixtureDbRaw)), ACADEMY_CURRICULUM);
   for (const acc of migratedView.db.accounts) {
     for (const doneId of acc.progress.completedLessonIds) {
       const entry = lessonIdx.get(doneId);
@@ -374,7 +350,7 @@ async function runTests() {
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfa-p23-test-'));
   const tmpDbPath = path.join(tmpDir, 'database.json');
-  fs.copyFileSync(path.join(rootDir, 'backups', 'pre-phase1', 'database.test-copy.json'), tmpDbPath);
+  writeBaselineFixtureCopy(tmpDbPath);
 
   const srv = await startTempServer(tmpDbPath, {
     sessionSecret: TEST_SECRET,
@@ -494,20 +470,14 @@ async function runTests() {
   }
 
   // =========================================================================
-  // 7. PRODUCTION database.json BYTE-FOR-BYTE SHA-256 PRESERVATION
+  // 7. LIVE DATABASE.JSON BYTE-FOR-BYTE SHA-256 PRESERVATION
   // =========================================================================
-  const liveDbBytes = fs.readFileSync(path.join(rootDir, 'database.json'));
-  const backupDbBytes = fs.readFileSync(
-    path.join(rootDir, 'backups', 'pre-phase2.3-20261118-090200', 'database.json')
-  );
-  const liveHash = crypto.createHash('sha256').update(liveDbBytes).digest('hex');
-  const backupHash = crypto.createHash('sha256').update(backupDbBytes).digest('hex');
-  assert.equal(liveHash, backupHash, 'database.json must remain byte-for-byte identical to pre-Phase 2.3 backup');
+  const liveCheck = assertLiveDbUnchanged(preRunLiveSha, rootDir);
 
   pass(
     'Data Preservation',
-    'Production database.json Byte-Identical Check',
-    `SHA-256 verified identical (${liveHash.slice(0, 16)}...) against pre-Phase 2.3 backup`
+    'Live database.json Byte-Identical Check',
+    `SHA-256 verified identical (${liveCheck.liveSha256.slice(0, 16)}...) across all ${liveCheck.accountsCount} live accounts`
   );
 
   console.log(`\nALL ${results.length} PHASE 2.3 VERIFICATION SUITES PASSED.`);

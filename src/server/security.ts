@@ -349,8 +349,10 @@ const SENSITIVE_EXACT_PATHS = new Set([
   '/database.json',
   '/package.json',
   '/package-lock.json',
+  '/bun.lock',
   '/tsconfig.json',
   '/vite.config.ts',
+  '/drizzle.config.ts',
   '/metadata.json',
   '/server.ts',
   '/server.cjs',
@@ -368,6 +370,8 @@ const SENSITIVE_EXACT_PATHS = new Set([
 
 const SENSITIVE_PREFIXES = [
   '/src/server',
+  '/src/db',
+  '/drizzle',
   '/src/data/curriculum',
   '/src/data/practicallabs',
   '/src/data/capstones',
@@ -424,8 +428,14 @@ export function isBlockedAppPath(rawUrlOrPath: string, mode: 'dev' | 'prod'): bo
   const normalized = path.posix.normalize(decoded.startsWith('/') ? decoded : `/${decoded}`);
   const lower = normalized.toLowerCase();
 
-  // Never serve source maps or backup artifacts
-  if (lower.endsWith('.map') || lower.endsWith('.bak') || lower.endsWith('.log')) {
+  // Never serve source maps, SQL migrations, encrypted backups, or backup artifacts
+  if (
+    lower.endsWith('.map') ||
+    lower.endsWith('.bak') ||
+    lower.endsWith('.log') ||
+    lower.endsWith('.sql') ||
+    lower.endsWith('.enc')
+  ) {
     return true;
   }
 
@@ -457,10 +467,12 @@ export function isBlockedAppPath(rawUrlOrPath: string, mode: 'dev' | 'prod'): bo
     }
   }
 
-  // Block /@id/ imports referencing server or private data modules in dev
+  // Block /@id/ imports referencing server, database, or private data modules in dev
   if (
     lower.startsWith('/@id/') &&
     (lower.includes('/src/server') ||
+      lower.includes('/src/db') ||
+      lower.includes('/drizzle') ||
       lower.includes('curriculum') ||
       lower.includes('practicallabs') ||
       lower.includes('capstones'))

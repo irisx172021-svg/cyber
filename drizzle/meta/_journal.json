@@ -8,6 +8,13 @@
       "when": 1795194425922,
       "tag": "0000_groovy_mister_fear",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1795249058844,
+      "tag": "0001_baseline_hardening_and_recovery",
+      "breakpoints": true
     }
   ]
 }

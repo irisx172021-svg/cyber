@@ -9,6 +9,11 @@ import { indexCurriculumLessons } from '../src/lib/curriculumProgress';
 import { isScryptHash, resolveSessionSecret } from '../src/server/auth';
 import { DbSchema, MAX_DAILY_POST_XP } from '../src/server/migration';
 import { TestCookieClient } from './testHttpClient';
+import {
+  assertLiveDbUnchanged,
+  snapshotFileSha256,
+  writeBaselineFixtureCopy,
+} from './testFixtures';
 
 process.env.CFA_NO_LISTEN = '1';
 
@@ -47,8 +52,8 @@ async function runTests() {
   };
 
   const rootDir = process.cwd();
+  const preRunLiveSha = snapshotFileSha256(path.join(rootDir, 'database.json'));
   const lessonIdx = indexCurriculumLessons(ACADEMY_CURRICULUM);
-  const baseDbCopy = path.join(rootDir, 'backups', 'pre-phase1', 'database.test-copy.json');
 
   // =========================================================================
   // 1. P0 STATIC SOURCE & PRODUCTION BUNDLE INSPECTION
@@ -132,7 +137,7 @@ async function runTests() {
   // =========================================================================
   const p0Dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfa-p17-p0-'));
   const p0DbPath = path.join(p0Dir, 'database.json');
-  fs.copyFileSync(baseDbCopy, p0DbPath);
+  writeBaselineFixtureCopy(p0DbPath);
 
   const p0Server = await startTempServer(p0DbPath, { sessionSecret: TEST_SECRET });
   try {
@@ -396,7 +401,7 @@ async function runTests() {
   // =========================================================================
   const p1AuthDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfa-p17-auth-'));
   const p1AuthDb = path.join(p1AuthDir, 'database.json');
-  fs.copyFileSync(baseDbCopy, p1AuthDb);
+  writeBaselineFixtureCopy(p1AuthDb);
 
   const authServer = await startTempServer(p1AuthDb, {
     sessionSecret: TEST_SECRET,
@@ -657,7 +662,7 @@ async function runTests() {
   // Verify trustProxy=true honors X-Forwarded-For cleanly when explicitly behind trusted proxy
   const tpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfa-p17-tp-'));
   const tpDb = path.join(tpDir, 'database.json');
-  fs.copyFileSync(baseDbCopy, tpDb);
+  writeBaselineFixtureCopy(tpDb);
   const tpServer = await startTempServer(tpDb, {
     sessionSecret: TEST_SECRET,
     trustProxy: true,
@@ -704,7 +709,7 @@ async function runTests() {
   const prevEnvSecret = process.env.AUTH_SESSION_SECRET;
   const secDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfa-p17-sec-'));
   const secDb = path.join(secDir, 'database.json');
-  fs.copyFileSync(baseDbCopy, secDb);
+  writeBaselineFixtureCopy(secDb);
   try {
     process.env.NODE_ENV = 'production';
     delete process.env.AUTH_SESSION_SECRET;
@@ -744,7 +749,7 @@ async function runTests() {
   // =========================================================================
   const postDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfa-p17-post-'));
   const postDb = path.join(postDir, 'database.json');
-  fs.copyFileSync(baseDbCopy, postDb);
+  writeBaselineFixtureCopy(postDb);
   const postServer = await startTempServer(postDb, {
     sessionSecret: TEST_SECRET,
     rateLimits: { postUserMax: 4, postUserWindowMs: 60_000 },
@@ -879,17 +884,13 @@ async function runTests() {
   }
 
   // =========================================================================
-  // 7. PRODUCTION DATABASE.JSON PRESERVATION CHECK
+  // 7. LIVE DATABASE.JSON PRESERVATION CHECK
   // =========================================================================
-  const prodDb = JSON.parse(fs.readFileSync(path.join(rootDir, 'database.json'), 'utf-8')) as DbSchema;
-  assert.equal(prodDb.accounts.length, 6, 'All 6 original accounts must remain intact in database.json');
-  for (const acc of prodDb.accounts) {
-    assert.equal(isScryptHash(acc.passwordHash), true);
-  }
+  const liveCheck = assertLiveDbUnchanged(preRunLiveSha, rootDir);
   pass(
     'Data Preservation',
-    'Production database.json Integrity',
-    `Confirmed all ${prodDb.accounts.length} original accounts preserved with salted scrypt hashes and unmodified XP/progress`
+    'Live database.json Integrity',
+    `Confirmed all ${liveCheck.accountsCount} accounts preserved with salted scrypt hashes and unmodified SHA-256`
   );
 
   console.log(`\nALL ${results.length} PHASE 1.7 SECURITY VERIFICATION SUITES PASSED.`);
